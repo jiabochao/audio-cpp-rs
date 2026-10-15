@@ -1,0 +1,25 @@
+[package]
+name = "audio-cpp-sys"
+description = "Raw FFI bindings to the audio.cpp C ABI (audiocpp.h)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+links = "audiocpp"
+build = "build.rs"
+categories = ["external-ffi-bindings", "multimedia::audio"]
+
+[build-dependencies]
+cmake = "0.1"
+
+[features]
+default = ["openmp", "native"]
+# Build host code with OpenMP (ENGINE_ENABLE_OPENMP).
+openmp = []
+# Compile ggml CPU kernels for the host ISA (ENGINE_ENABLE_NATIVE_CPU).
+# Disable for portable binaries.
+native = []
+cuda = []
+hip = []
+vulkan = []
+metal = []

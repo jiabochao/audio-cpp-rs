@@ -1,0 +1,33 @@
+[workspace]
+members = ["audio-cpp-sys"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+
+[package]
+name = "audio-cpp"
+description = "Safe Rust bindings for audio.cpp, a ggml-based audio inference framework (TTS, ASR, VAD, ...)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords = ["audio", "tts", "asr", "ggml", "speech"]
+categories = ["api-bindings", "multimedia::audio"]
+
+[dependencies]
+audio-cpp-sys = { path = "audio-cpp-sys", version = "0.1.0", default-features = false }
+
+[dev-dependencies]
+hound = "3.5"
+
+[features]
+default = ["openmp", "native"]
+openmp = ["audio-cpp-sys/openmp"]
+native = ["audio-cpp-sys/native"]
+cuda = ["audio-cpp-sys/cuda"]
+hip = ["audio-cpp-sys/hip"]
+vulkan = ["audio-cpp-sys/vulkan"]
+metal = ["audio-cpp-sys/metal"]
