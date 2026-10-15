@@ -280,7 +280,7 @@ fn abi_version(header: &Path) -> Result<(u32, u32), BoxError> {
 /// The library must have the same major ABI and at least the minor the
 /// bindings declare, or symbols the bindings reference may be missing.
 fn check_abi(header: &Path) -> Result<(), BoxError> {
-    let ours = abi_version(&PathBuf::from(env::var("CARGO_MANIFEST_DIR")?).join("include/audiocpp.h"))?;
+    let ours = abi_version(&bindings_header())?;
     let theirs = abi_version(header)?;
     if theirs.0 != ours.0 || theirs.1 < ours.1 {
         return Err(format!(
@@ -302,9 +302,18 @@ fn has_library(dir: &Path) -> bool {
 // Source build
 // ---------------------------------------------------------------------------
 
+fn bindings_header() -> PathBuf {
+    PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("include/audiocpp.h")
+}
+
 fn source_dir() -> PathBuf {
     if let Some(dir) = env::var_os("AUDIOCPP_SRC_DIR") {
-        return PathBuf::from(dir);
+        let dir = PathBuf::from(dir);
+        // A user-supplied tree may be any revision; it only has to be compatible.
+        if let Err(e) = check_abi(&dir.join("include/audiocpp.h")) {
+            panic!("AUDIOCPP_SRC_DIR {}: {e}", dir.display());
+        }
+        return dir;
     }
     let root = out_dir().join("source");
     let source = root.join(format!("audio.cpp-{SOURCE_COMMIT}"));
@@ -327,8 +336,32 @@ fn source_dir() -> PathBuf {
     if let Err(e) = result {
         panic!("failed to download audio.cpp source from {url}: {e}");
     }
+    // The pinned commit must carry exactly the header the bindings were
+    // generated from; anything else means the pin and the snapshot drifted.
+    let normalize = |path: &Path| fs::read_to_string(path).map(|text| text.replace("\r\n", "\n"));
+    if normalize(&source.join("include/audiocpp.h")).ok() != normalize(&bindings_header()).ok() {
+        fs::remove_dir_all(&root).ok();
+        panic!(
+            "audiocpp.h at {SOURCE_COMMIT} differs from include/audiocpp.h; update the pin or regenerate the bindings"
+        );
+    }
     fs::write(source.join(".complete"), SOURCE_COMMIT).unwrap();
     source
+}
+
+/// CMake refuses a build tree configured for another source directory, which
+/// happens when switching between AUDIOCPP_SRC_DIR and the downloaded source.
+fn discard_stale_cmake_cache(source: &Path) {
+    let build = out_dir().join("build");
+    let Ok(cache) = fs::read_to_string(build.join("CMakeCache.txt")) else { return };
+    let configured = cache.lines().find_map(|line| line.strip_prefix("CMAKE_HOME_DIRECTORY:INTERNAL="));
+    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    };
+    if configured.is_some_and(|dir| !same(Path::new(dir), source)) {
+        fs::remove_dir_all(&build).ok();
+    }
 }
 
 fn build_from_source() -> PathBuf {
@@ -341,6 +374,7 @@ fn build_from_source() -> PathBuf {
             println!("cargo:rerun-if-changed={}", source.join(path).display());
         }
     }
+    discard_stale_cmake_cache(&source);
 
     let on_off = |enabled: bool| if enabled { "ON" } else { "OFF" };
     let mut config = cmake::Config::new(&source);
@@ -355,9 +389,17 @@ fn build_from_source() -> PathBuf {
         .define("ENGINE_ENABLE_METAL", on_off(feature("metal")))
         .define("ENGINE_ENABLE_OPENMP", on_off(feature("openmp")))
         .define("ENGINE_ENABLE_NATIVE_CPU", on_off(feature("native")))
+        // Compile model specs into the library, so it does not look for a
+        // model_specs directory next to wherever it is deployed.
+        .define("AUDIOCPP_DEPLOYMENT_BUILD", "ON")
         .define("ENGINE_BUILD_EXAMPLES", "OFF")
         .define("ENGINE_BUILD_TESTS", "OFF");
 
+    if env::var("CARGO_CFG_TARGET_ENV").is_ok_and(|e| e == "msvc") {
+        // Upstream sources contain non-ASCII literals; MSVC otherwise decodes
+        // them with the machine's ANSI code page.
+        config.cflag("/utf-8").cxxflag("/utf-8");
+    }
     if let Ok(set) = env::var("AUDIOCPP_MODEL_SET") {
         config.define("AUDIOCPP_MODEL_SET", set);
     }

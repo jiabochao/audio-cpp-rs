@@ -2,6 +2,7 @@ use std::ffi::c_char;
 use std::ptr::NonNull;
 
 use crate::error::{Error, Result, check};
+use crate::model::allocation_failed;
 use crate::result::ArtifactKind;
 use crate::{c_string, handle, opt_c_string, opt_ptr, sys};
 
@@ -29,16 +30,22 @@ pub(crate) fn frames(samples: &[f32], channels: u32) -> Result<usize> {
     Ok(samples.len() / channels as usize)
 }
 
+fn finite(value: f32, what: &str) -> Result<f32> {
+    if value.is_finite() { Ok(value) } else { Err(Error::invalid_argument(format!("{what} must be finite"))) }
+}
+
 pub(crate) fn positive_i32(value: u32, what: &str) -> Result<i32> {
-    i32::try_from(value).map_err(|_| Error::invalid_argument(format!("{what} is out of range")))
+    i32::try_from(value)
+        .ok()
+        .filter(|&v| v > 0)
+        .ok_or_else(|| Error::invalid_argument(format!("{what} must be in 1..={}", i32::MAX)))
 }
 
 impl Request {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self> {
         // SAFETY: no preconditions.
         let ptr = unsafe { sys::audiocpp_request_create() };
-        let ptr = NonNull::new(ptr).expect("audiocpp_request_create returned NULL (out of memory)");
-        Self { ptr }
+        NonNull::new(ptr).map(|ptr| Self { ptr }).ok_or_else(|| allocation_failed("request"))
     }
 
     /// Sets the text. A non-empty `language` is also written to the
@@ -106,6 +113,7 @@ impl Request {
     /// `--speaking-rate`.
     pub fn set_speaking_rate(&mut self, rate: f32) -> Result<&mut Self> {
         // SAFETY: valid handle.
+        let rate = finite(rate, "speaking rate")?;
         check(unsafe { sys::audiocpp_request_set_speaking_rate(self.as_ptr(), rate) })?;
         Ok(self)
     }
@@ -113,6 +121,7 @@ impl Request {
     /// `--pitch-shift`.
     pub fn set_pitch_shift(&mut self, shift: f32) -> Result<&mut Self> {
         // SAFETY: valid handle.
+        let shift = finite(shift, "pitch shift")?;
         check(unsafe { sys::audiocpp_request_set_pitch_shift(self.as_ptr(), shift) })?;
         Ok(self)
     }
@@ -120,6 +129,7 @@ impl Request {
     /// `--energy-scale`.
     pub fn set_energy_scale(&mut self, scale: f32) -> Result<&mut Self> {
         // SAFETY: valid handle.
+        let scale = finite(scale, "energy scale")?;
         check(unsafe { sys::audiocpp_request_set_energy_scale(self.as_ptr(), scale) })?;
         Ok(self)
     }
@@ -181,12 +191,6 @@ impl Request {
             sys::audiocpp_request_set_option_array(self.as_ptr(), key.as_ptr(), ptrs.as_ptr(), ptrs.len())
         })?;
         Ok(self)
-    }
-}
-
-impl Default for Request {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

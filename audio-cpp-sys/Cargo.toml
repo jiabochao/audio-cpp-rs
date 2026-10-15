@@ -20,11 +20,12 @@ ureq = "3"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [features]
-default = ["openmp", "native"]
+default = ["openmp"]
 # Build host code with OpenMP (ENGINE_ENABLE_OPENMP).
 openmp = []
-# Compile ggml CPU kernels for the host ISA (ENGINE_ENABLE_NATIVE_CPU).
-# Disable for portable binaries.
+# Source builds only: compile ggml CPU kernels for the host ISA
+# (ENGINE_ENABLE_NATIVE_CPU). Faster, but the library only runs on CPUs like
+# the build machine's.
 native = []
 cuda = []
 hip = []

@@ -3,6 +3,7 @@ use std::marker::{PhantomData, PhantomPinned};
 use std::ops::Deref;
 use std::ptr;
 
+use crate::error::{Error, ErrorKind, Result, check};
 use crate::{handle, owned_string, sys};
 
 /// Kinds of opaque payloads a family produces or consumes.
@@ -74,18 +75,45 @@ impl AudioRef<'_> {
     }
 }
 
-/// Builds an `AudioRef` from the C out parameters.
+fn invalid_output(what: &str) -> Error {
+    Error::new(ErrorKind::Runtime, format!("library returned {what}"))
+}
+
+/// Builds an `AudioRef` from the C out parameters, validating the format.
 ///
 /// # Safety
-/// `samples` must be NULL or point at `frames * channels` floats living for `'a`.
-unsafe fn audio_ref<'a>(samples: *const f32, frames: usize, sample_rate: c_int, channels: c_int) -> AudioRef<'a> {
-    let channels = channels.max(1) as u32;
-    let samples = if samples.is_null() || frames == 0 {
+/// `samples` must be NULL with `frames == 0`, or point at `frames * channels`
+/// floats living for `'a`.
+unsafe fn audio_ref<'a>(
+    samples: *const f32,
+    frames: usize,
+    sample_rate: c_int,
+    channels: c_int,
+) -> Result<AudioRef<'a>> {
+    if sample_rate <= 0 || channels <= 0 {
+        return Err(invalid_output(&format!("an invalid PCM format ({sample_rate} Hz, {channels} channels)")));
+    }
+    let len = frames
+        .checked_mul(channels as usize)
+        .filter(|&len| len <= isize::MAX as usize / size_of::<f32>())
+        .ok_or_else(|| invalid_output("an oversized PCM buffer"))?;
+    let samples = if len == 0 {
         &[][..]
+    } else if samples.is_null() {
+        return Err(invalid_output("a NULL PCM buffer"));
     } else {
-        unsafe { std::slice::from_raw_parts(samples, frames * channels as usize) }
+        unsafe { std::slice::from_raw_parts(samples, len) }
     };
-    AudioRef { samples, sample_rate: sample_rate.max(0) as u32, channels }
+    Ok(AudioRef { samples, sample_rate: sample_rate as u32, channels: channels as u32 })
+}
+
+/// Maps NOT_AVAILABLE to `None` and any other failure to an error.
+fn optional(status: sys::audiocpp_status) -> Result<bool> {
+    if status == sys::AUDIOCPP_ERR_NOT_AVAILABLE {
+        return Ok(false);
+    }
+    check(status)?;
+    Ok(true)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,7 +167,8 @@ pub struct ArtifactRef<'a> {
 /// The contents of a task result. Obtained by dereferencing a [`TaskResult`]
 /// or from [`crate::Event::result`]; never owned directly.
 ///
-/// Absent outputs read as `None` or an empty `Vec`.
+/// Absent outputs read as `Ok(None)` or an empty `Vec`; errors are reserved
+/// for malformed library output.
 pub struct ResultView {
     _opaque: [u8; 0],
     _marker: PhantomData<(*mut u8, PhantomPinned)>,
@@ -157,49 +186,49 @@ impl ResultView {
     }
 
     /// The main audio output, if the task produced any.
-    pub fn audio(&self) -> Option<AudioRef<'_>> {
+    pub fn audio(&self) -> Result<Option<AudioRef<'_>>> {
         let (mut samples, mut frames, mut rate, mut channels) = (ptr::null(), 0usize, 0, 0);
         // SAFETY: valid handle; the samples are borrowed for the life of &self.
         let status =
             unsafe { sys::audiocpp_result_audio(self.raw(), &mut samples, &mut frames, &mut rate, &mut channels) };
-        (status == sys::AUDIOCPP_OK).then(|| unsafe { audio_ref(samples, frames, rate, channels) })
+        if !optional(status)? {
+            return Ok(None);
+        }
+        unsafe { audio_ref(samples, frames, rate, channels) }.map(Some)
     }
 
     /// The text output (transcript, partial text, ...), if any.
-    pub fn text(&self) -> Option<Text> {
+    pub fn text(&self) -> Result<Option<Text>> {
         let (mut text, mut language): (*const c_char, *const c_char) = (ptr::null(), ptr::null());
         // SAFETY: valid handle; strings copied immediately.
         let status = unsafe { sys::audiocpp_result_text(self.raw(), &mut text, &mut language) };
-        (status == sys::AUDIOCPP_OK)
-            .then(|| unsafe { Text { text: owned_string(text), language: owned_string(language) } })
+        if !optional(status)? {
+            return Ok(None);
+        }
+        Ok(Some(unsafe { Text { text: owned_string(text), language: owned_string(language) } }))
     }
 
-    pub fn segments(&self) -> Vec<Segment> {
+    pub fn segments(&self) -> Result<Vec<Segment>> {
         // SAFETY: valid handle; indices in range; strings copied.
         let count = unsafe { sys::audiocpp_result_segment_count(self.raw()) };
         (0..count)
-            .filter_map(|i| {
+            .map(|i| {
                 let (mut start, mut end, mut confidence, mut text) = (0, 0, 0.0, ptr::null());
-                let status = unsafe {
+                check(unsafe {
                     sys::audiocpp_result_segment(self.raw(), i, &mut start, &mut end, &mut confidence, &mut text)
-                };
-                (status == sys::AUDIOCPP_OK).then(|| Segment {
-                    start_sample: start,
-                    end_sample: end,
-                    confidence,
-                    text: unsafe { owned_string(text) },
-                })
+                })?;
+                Ok(Segment { start_sample: start, end_sample: end, confidence, text: unsafe { owned_string(text) } })
             })
             .collect()
     }
 
-    pub fn speaker_turns(&self) -> Vec<SpeakerTurn> {
+    pub fn speaker_turns(&self) -> Result<Vec<SpeakerTurn>> {
         // SAFETY: as in `segments`.
         let count = unsafe { sys::audiocpp_result_speaker_turn_count(self.raw()) };
         (0..count)
-            .filter_map(|i| {
+            .map(|i| {
                 let (mut start, mut end, mut speaker, mut confidence, mut text) = (0, 0, ptr::null(), 0.0, ptr::null());
-                let status = unsafe {
+                check(unsafe {
                     sys::audiocpp_result_speaker_turn(
                         self.raw(),
                         i,
@@ -209,8 +238,8 @@ impl ResultView {
                         &mut confidence,
                         &mut text,
                     )
-                };
-                (status == sys::AUDIOCPP_OK).then(|| SpeakerTurn {
+                })?;
+                Ok(SpeakerTurn {
                     start_sample: start,
                     end_sample: end,
                     speaker_id: unsafe { owned_string(speaker) },
@@ -221,33 +250,28 @@ impl ResultView {
             .collect()
     }
 
-    pub fn words(&self) -> Vec<Word> {
+    pub fn words(&self) -> Result<Vec<Word>> {
         // SAFETY: as in `segments`.
         let count = unsafe { sys::audiocpp_result_word_count(self.raw()) };
         (0..count)
-            .filter_map(|i| {
+            .map(|i| {
                 let (mut word, mut start, mut end, mut confidence) = (ptr::null(), 0, 0, 0.0);
-                let status = unsafe {
+                check(unsafe {
                     sys::audiocpp_result_word(self.raw(), i, &mut word, &mut start, &mut end, &mut confidence)
-                };
-                (status == sys::AUDIOCPP_OK).then(|| Word {
-                    word: unsafe { owned_string(word) },
-                    start_sample: start,
-                    end_sample: end,
-                    confidence,
-                })
+                })?;
+                Ok(Word { word: unsafe { owned_string(word) }, start_sample: start, end_sample: end, confidence })
             })
             .collect()
     }
 
-    pub fn named_audio(&self) -> Vec<NamedAudio<'_>> {
+    pub fn named_audio(&self) -> Result<Vec<NamedAudio<'_>>> {
         // SAFETY: valid handle; samples borrowed for the life of &self.
         let count = unsafe { sys::audiocpp_result_named_audio_count(self.raw()) };
         (0..count)
-            .filter_map(|i| {
+            .map(|i| {
                 let (mut id, mut samples, mut frames, mut rate, mut channels) =
                     (ptr::null(), ptr::null(), 0usize, 0, 0);
-                let status = unsafe {
+                check(unsafe {
                     sys::audiocpp_result_named_audio(
                         self.raw(),
                         i,
@@ -257,50 +281,49 @@ impl ResultView {
                         &mut rate,
                         &mut channels,
                     )
-                };
-                (status == sys::AUDIOCPP_OK).then(|| NamedAudio {
+                })?;
+                Ok(NamedAudio {
                     id: unsafe { owned_string(id) },
-                    audio: unsafe { audio_ref(samples, frames, rate, channels) },
+                    audio: unsafe { audio_ref(samples, frames, rate, channels)? },
                 })
             })
             .collect()
     }
 
-    pub fn artifacts(&self) -> Vec<ArtifactRef<'_>> {
+    pub fn artifacts(&self) -> Result<Vec<ArtifactRef<'_>>> {
         // SAFETY: valid handle; payload borrowed for the life of &self.
         let count = unsafe { sys::audiocpp_result_artifact_count(self.raw()) };
         (0..count)
-            .filter_map(|i| {
+            .map(|i| {
                 let (mut kind, mut id, mut payload, mut bytes) = (0, ptr::null(), ptr::null::<c_void>(), 0usize);
-                let status = unsafe {
+                check(unsafe {
                     sys::audiocpp_result_artifact(self.raw(), i, &mut kind, &mut id, &mut payload, &mut bytes)
-                };
-                if status != sys::AUDIOCPP_OK {
-                    return None;
-                }
-                let payload = if payload.is_null() || bytes == 0 {
+                })?;
+                let payload = if bytes == 0 {
                     &[][..]
+                } else if payload.is_null() || bytes > isize::MAX as usize {
+                    return Err(invalid_output("a NULL or oversized artifact payload"));
                 } else {
                     unsafe { std::slice::from_raw_parts(payload.cast::<u8>(), bytes) }
                 };
-                Some(ArtifactRef {
+                Ok(ArtifactRef {
                     kind: ArtifactKind::from_raw(kind),
                     id: unsafe { owned_string(id) },
                     payload,
-                    meta: self.artifact_meta(i),
+                    meta: self.artifact_meta(i)?,
                 })
             })
             .collect()
     }
 
-    fn artifact_meta(&self, index: usize) -> Vec<(String, String)> {
+    fn artifact_meta(&self, index: usize) -> Result<Vec<(String, String)>> {
         // SAFETY: valid handle; indices in range; strings copied.
         let count = unsafe { sys::audiocpp_result_artifact_meta_count(self.raw(), index) };
         (0..count)
-            .filter_map(|j| {
+            .map(|j| {
                 let (mut key, mut value) = (ptr::null(), ptr::null());
-                let status = unsafe { sys::audiocpp_result_artifact_meta(self.raw(), index, j, &mut key, &mut value) };
-                (status == sys::AUDIOCPP_OK).then(|| unsafe { (owned_string(key), owned_string(value)) })
+                check(unsafe { sys::audiocpp_result_artifact_meta(self.raw(), index, j, &mut key, &mut value) })?;
+                Ok(unsafe { (owned_string(key), owned_string(value)) })
             })
             .collect()
     }
@@ -308,14 +331,15 @@ impl ResultView {
 
 impl std::fmt::Debug for ResultView {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let count = |n: Result<usize>| n.map_or_else(|e| e.to_string(), |n| n.to_string());
         f.debug_struct("ResultView")
-            .field("audio", &self.audio().map(|a| (a.frames(), a.sample_rate, a.channels)))
+            .field("audio", &self.audio().map(|a| a.map(|a| (a.frames(), a.sample_rate, a.channels))))
             .field("text", &self.text())
-            .field("segments", &self.segments().len())
-            .field("speaker_turns", &self.speaker_turns().len())
-            .field("words", &self.words().len())
-            .field("named_audio", &self.named_audio().len())
-            .field("artifacts", &self.artifacts().len())
+            .field("segments", &count(self.segments().map(|v| v.len())))
+            .field("speaker_turns", &count(self.speaker_turns().map(|v| v.len())))
+            .field("words", &count(self.words().map(|v| v.len())))
+            .field("named_audio", &count(self.named_audio().map(|v| v.len())))
+            .field("artifacts", &count(self.artifacts().map(|v| v.len())))
             .finish()
     }
 }

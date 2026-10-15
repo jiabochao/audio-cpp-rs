@@ -18,11 +18,13 @@ let registry = Registry::new()?;
 let model = registry.load_model("models/kokoro-82m-q8_0.gguf", &ModelConfig::family("kokoro_tts"), None)?;
 let mut session = model.create_session("tts", Mode::Offline, &BackendConfig::new(Backend::Cuda), None)?;
 
-let mut request = Request::new();
+let mut request = Request::new()?;
 request.set_text("Hello from Rust.", Some("en-us"))?.set_option("voice-id", "af_heart")?;
 
 let result = session.run(&request)?;
-let audio = result.audio().unwrap(); // &[f32] interleaved, borrowed from `result`
+if let Some(audio) = result.audio()? {
+    // audio.samples: &[f32] interleaved, borrowed from `result`
+}
 ```
 
 Inputs and outputs:
@@ -30,7 +32,9 @@ Inputs and outputs:
 - **Request**: text, audio (`&[f32]` interleaved PCM), a speaker reference, style
   controls, artifacts, and options (`set_option` maps to `--request-option`).
 - **Result**: `audio()`, `text()`, `segments()`, `speaker_turns()`, `words()`,
-  `named_audio()`, `artifacts()`.
+  `named_audio()`, `artifacts()`. An output the task did not produce reads as
+  `Ok(None)` or an empty `Vec`. `Err` means the library returned something
+  malformed; failures are never silently skipped.
 - **Streaming**: create the session with `Mode::Streaming`, then call
   `stream_start`, `stream_push` with each chunk, `stream_next_event`, and
   `stream_finish`.
@@ -38,8 +42,20 @@ Inputs and outputs:
   `Model::supports(task, mode)` reports what it can do, and
   `audio_cpp::tasks()` lists the task names this build knows.
 
-Handles are `Send` but not `Sync`. Each handle keeps its parent alive, so
-dropping the `Model` or `Registry` early is safe.
+Handles are `Send` but not `Sync`: you can move one to another thread, but
+never use one handle from two threads at once. Each handle keeps its parent
+alive, so dropping the `Model` or `Registry` early is safe.
+
+`Model::create_session` holds a process-wide lock while it runs. Models loaded
+separately can share upstream weight caches, and creating Silero sessions
+concurrently crashes with a segfault without the lock (a regression test
+covers this). Inference in separate sessions still runs in parallel. Code that
+calls the raw `audio_cpp::sys` API directly must serialize session creation
+itself.
+
+Inputs are checked before they reach C: interior NUL bytes, partial PCM
+frames, non-positive sample rates or channel counts, non-finite style values,
+invalid device or thread counts, and negative or overflowing stream offsets.
 
 ## Examples
 
@@ -72,7 +88,10 @@ audio-cpp = { git = "<this repo>", features = ["cuda"] }
 3. **Source build**: if no compatible archive exists, download the upstream
    source at the commit pinned in `audio-cpp-sys/build.rs` and build it with
    CMake. This needs a C++17 compiler and CMake, and always builds in Release
-   mode.
+   mode, with model specs compiled in (`AUDIOCPP_DEPLOYMENT_BUILD=ON`). The
+   downloaded source must contain the same `audiocpp.h` as
+   `audio-cpp-sys/include/`. A tree given through `AUDIOCPP_SRC_DIR` only needs
+   a compatible ABI.
 
 > Upstream releases up to v0.9.1 ship no `-lib-` archives, so until the next
 > release step 2 always falls through to a source build.
@@ -91,7 +110,7 @@ The `hip` feature, and any other target, always builds from source.
 |---|---|
 | `cuda`, `vulkan`, `metal`, `hip` | GPU backend; also selects the prebuilt archive |
 | `openmp` (default) | source build only: `ENGINE_ENABLE_OPENMP` |
-| `native` (default) | source build only: ggml CPU kernels tuned for the host CPU |
+| `native` | source build only: ggml CPU kernels tuned for the host CPU. Faster, but the library runs only on CPUs like the build machine's. |
 
 Environment variables:
 

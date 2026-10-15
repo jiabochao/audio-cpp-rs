@@ -25,18 +25,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = registry.load_model(model_path, &ModelConfig::family(family.as_str()), None)?;
     let mut session = model.create_session("asr", Mode::Offline, &BackendConfig::new(Backend::Best), None)?;
 
-    let mut request = Request::new();
+    let mut request = Request::new()?;
     request.set_audio(&samples, spec.sample_rate, spec.channels as u32)?;
     if let Some(language) = rest.first() {
         request.set_option("language", language)?;
     }
 
     let result = session.run(&request)?;
-    match result.text() {
+    match result.text()? {
         Some(text) => println!("{}", text.text),
         None => eprintln!("model produced no text"),
     }
-    for segment in result.segments() {
+    for segment in result.segments()? {
         let to_secs = |s: i64| s as f64 / spec.sample_rate as f64;
         println!("[{:7.2} - {:7.2}] {}", to_secs(segment.start_sample), to_secs(segment.end_sample), segment.text);
     }

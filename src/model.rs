@@ -1,6 +1,7 @@
 use std::ffi::{CString, c_char, c_int};
 use std::path::Path;
 use std::ptr::{self, NonNull};
+use std::sync::{Mutex, PoisonError};
 
 use crate::error::{Error, ErrorKind, Result, check};
 use crate::session::Session;
@@ -15,16 +16,15 @@ handle!(
 );
 
 impl Options {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self> {
         // SAFETY: no preconditions.
         let ptr = unsafe { sys::audiocpp_options_create() };
-        let ptr = NonNull::new(ptr).expect("audiocpp_options_create returned NULL (out of memory)");
-        Self { ptr }
+        NonNull::new(ptr).map(|ptr| Self { ptr }).ok_or_else(|| allocation_failed("options"))
     }
 
     /// Builds an option map from key/value pairs.
     pub fn from_pairs<K: AsRef<str>, V: AsRef<str>>(pairs: impl IntoIterator<Item = (K, V)>) -> Result<Self> {
-        let mut options = Self::new();
+        let mut options = Self::new()?;
         for (key, value) in pairs {
             options.set(key.as_ref(), value.as_ref())?;
         }
@@ -40,11 +40,21 @@ impl Options {
     }
 }
 
-impl Default for Options {
-    fn default() -> Self {
-        Self::new()
-    }
+/// Constructors that return a bare pointer do not set `audiocpp_last_error`,
+/// so reading it after one fails would report an unrelated, stale message.
+pub(crate) fn allocation_failed(what: &str) -> Error {
+    Error::new(ErrorKind::OutOfMemory, format!("failed to allocate {what}"))
 }
+
+/// Serializes `audiocpp_session_create` across every model and registry.
+///
+/// Separately loaded models can share cached weight sources upstream. Silero
+/// session construction uploads from that source and then unmaps it, so a
+/// concurrent construction elsewhere reads freed memory and crashes
+/// (reproduced: 8 threads each loading a model and creating sessions crash
+/// almost every run). Running sessions do not touch the shared source, so only
+/// construction is serialized.
+static SESSION_CREATION: Mutex<()> = Mutex::new(());
 
 fn options_ptr(options: Option<&Options>) -> *const sys::audiocpp_options {
     options.map_or(ptr::null(), |o| o.as_ptr())
@@ -99,15 +109,15 @@ impl Registry {
     }
 
     /// Names of the model families this build can load.
-    pub fn families(&self) -> Vec<String> {
+    pub fn families(&self) -> Result<Vec<String>> {
         // SAFETY: valid handle.
         let count = unsafe { sys::audiocpp_registry_family_count(self.as_ptr()) };
         (0..count)
-            .filter_map(|i| {
+            .map(|i| {
                 let mut name: *const c_char = ptr::null();
                 // SAFETY: index in range; the string is copied immediately.
-                let status = unsafe { sys::audiocpp_registry_family(self.as_ptr(), i, &mut name) };
-                (status == sys::AUDIOCPP_OK).then(|| unsafe { owned_string(name) })
+                check(unsafe { sys::audiocpp_registry_family(self.as_ptr(), i, &mut name) })?;
+                Ok(unsafe { owned_string(name) })
             })
             .collect()
     }
@@ -324,14 +334,14 @@ impl Model {
         unsafe { sys::audiocpp_model_supports_style_condition(self.as_ptr()) != 0 }
     }
 
-    pub fn languages(&self) -> Vec<String> {
+    pub fn languages(&self) -> Result<Vec<String>> {
         // SAFETY: valid handle; indices in range; strings copied.
         let count = unsafe { sys::audiocpp_model_language_count(self.as_ptr()) };
         (0..count)
-            .filter_map(|i| {
+            .map(|i| {
                 let mut language: *const c_char = ptr::null();
-                let status = unsafe { sys::audiocpp_model_language(self.as_ptr(), i, &mut language) };
-                (status == sys::AUDIOCPP_OK).then(|| unsafe { owned_string(language) })
+                check(unsafe { sys::audiocpp_model_language(self.as_ptr(), i, &mut language) })?;
+                Ok(unsafe { owned_string(language) })
             })
             .collect()
     }
@@ -383,23 +393,33 @@ impl Model {
         backend: &BackendConfig,
         options: Option<&Options>,
     ) -> Result<Session> {
+        if backend.device < 0 || backend.threads <= 0 {
+            return Err(Error::invalid_argument("device must be non-negative and threads positive"));
+        }
         let task = c_string(task, "task")?;
         let raw = sys::audiocpp_backend_config {
             backend: backend.backend.as_c_str().as_ptr(),
             device: backend.device,
             threads: backend.threads,
         };
-        // SAFETY: all pointers outlive the call.
         create(
-            |out| unsafe {
-                sys::audiocpp_session_create(
-                    self.as_ptr(),
-                    task.as_ptr(),
-                    mode.as_c_str().as_ptr(),
-                    &raw,
-                    options_ptr(options),
-                    out,
-                )
+            |out| {
+                // The lock guards native state, not Rust data, and the C ABI
+                // contains exceptions, so a poisoned lock is safe to reuse. The
+                // error detail is thread-local, so checking it after the lock is
+                // released cannot pick up another thread's failure.
+                let _guard = SESSION_CREATION.lock().unwrap_or_else(PoisonError::into_inner);
+                // SAFETY: all pointers outlive the call.
+                unsafe {
+                    sys::audiocpp_session_create(
+                        self.as_ptr(),
+                        task.as_ptr(),
+                        mode.as_c_str().as_ptr(),
+                        &raw,
+                        options_ptr(options),
+                        out,
+                    )
+                }
             },
             |p| unsafe { Session::from_raw(p) },
         )
@@ -414,7 +434,7 @@ impl std::fmt::Debug for Options {
 
 impl std::fmt::Debug for Registry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Registry").field("families", &self.families().len()).finish()
+        f.debug_struct("Registry").field("families", &self.families().map(|f| f.len())).finish()
     }
 }
 

@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let Some(model_path) = args.next() else {
         println!("tasks: {}", audio_cpp::tasks().join(", "));
         println!("families:");
-        for family in registry.families() {
+        for family in registry.families()? {
             println!("  {family}");
         }
         return Ok(());
@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let tasks: Vec<_> = audio_cpp::tasks().into_iter().filter(|t| model.supports(t, mode)).collect();
         println!("{} tasks: {}", mode.as_str(), tasks.join(", "));
     }
-    println!("languages: {}", model.languages().join(", "));
+    println!("languages: {}", model.languages()?.join(", "));
     for (scope, name) in
         [(OptionScope::Load, "load"), (OptionScope::Session, "session"), (OptionScope::Request, "request")]
     {

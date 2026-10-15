@@ -25,7 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = registry.load_model(model_path, &ModelConfig::family(family.as_str()), None)?;
     let mut session = model.create_session("tts", Mode::Offline, &BackendConfig::new(Backend::Best), None)?;
 
-    let mut request = Request::new();
+    let mut request = Request::new()?;
     request.set_text(text, None)?;
     for option in options {
         let (key, value) = option.split_once('=').ok_or("options must be key=value")?;
@@ -34,7 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let started = std::time::Instant::now();
     let result = session.run(&request)?;
-    let audio = result.audio().ok_or("model produced no audio")?;
+    let audio = result.audio()?.ok_or("model produced no audio")?;
     println!(
         "{:.2}s of audio at {} Hz in {:.2}s",
         audio.duration_secs(),

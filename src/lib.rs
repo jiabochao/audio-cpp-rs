@@ -28,13 +28,13 @@
 //!     None,
 //! )?;
 //!
-//! let mut request = Request::new();
+//! let mut request = Request::new()?;
 //! request
 //!     .set_text("Hello from audio.cpp.", Some("en-us"))?
 //!     .set_option("voice-id", "af_heart")?;
 //!
 //! let result = session.run(&request)?;
-//! if let Some(audio) = result.audio() {
+//! if let Some(audio) = result.audio()? {
 //!     println!("{} frames at {} Hz", audio.frames(), audio.sample_rate);
 //! }
 //! # Ok(())

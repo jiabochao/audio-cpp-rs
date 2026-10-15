@@ -1,7 +1,7 @@
 use std::ops::Deref;
 use std::ptr::{self, NonNull};
 
-use crate::error::{Result, check};
+use crate::error::{Error, Result, check};
 use crate::request::{Request, frames, positive_i32};
 use crate::result::{ResultView, TaskResult};
 use crate::{create, handle, owned_string, sys};
@@ -102,6 +102,10 @@ impl Session {
         start_sample: i64,
     ) -> Result<Option<Event>> {
         let frames = frames(samples, channels)?;
+        let end = i64::try_from(frames).ok().and_then(|n| start_sample.checked_add(n));
+        if start_sample < 0 || end.is_none() {
+            return Err(Error::invalid_argument(format!("invalid stream offset {start_sample}")));
+        }
         let (rate, ch) = (positive_i32(sample_rate, "sample_rate")?, positive_i32(channels, "channels")?);
         let mut event: *mut sys::audiocpp_event = ptr::null_mut();
         // SAFETY: the slice covers frames * channels floats and is copied.
@@ -166,16 +170,16 @@ impl Event {
         unsafe { ResultView::from_ptr(sys::audiocpp_event_as_result(self.as_ptr())) }
     }
 
-    pub fn voice_activity(&self) -> Vec<VoiceActivity> {
+    pub fn voice_activity(&self) -> Result<Vec<VoiceActivity>> {
         // SAFETY: valid handle; indices in range.
         let count = unsafe { sys::audiocpp_event_voice_activity_count(self.as_ptr()) };
         (0..count)
-            .filter_map(|i| {
+            .map(|i| {
                 let (mut kind, mut sample, mut probability) = (0, 0i64, 0f32);
-                let status = unsafe {
+                check(unsafe {
                     sys::audiocpp_event_voice_activity(self.as_ptr(), i, &mut kind, &mut sample, &mut probability)
-                };
-                (status == sys::AUDIOCPP_OK).then_some(VoiceActivity {
+                })?;
+                Ok(VoiceActivity {
                     kind: match kind {
                         sys::AUDIOCPP_VOICE_ACTIVITY_SPEECH_START => VoiceActivityKind::SpeechStart,
                         sys::AUDIOCPP_VOICE_ACTIVITY_SPEECH_END => VoiceActivityKind::SpeechEnd,

@@ -17,11 +17,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = registry.load_model(&model, &ModelConfig::family("silero_vad"), None)?;
     let mut session = model.create_session("vad", Mode::Offline, &BackendConfig::default(), None)?;
 
-    let mut request = Request::new();
+    let mut request = Request::new()?;
     request.set_audio(&samples, rate, channels)?;
     let result = session.run(&request)?;
 
-    for segment in result.segments() {
+    for segment in result.segments()? {
         println!(
             "speech {:7.2}s - {:7.2}s",
             segment.start_sample as f64 / rate as f64,

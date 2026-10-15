@@ -53,11 +53,40 @@ fn unknown_family_is_reported() {
 
 #[test]
 fn interior_nul_is_rejected_before_ffi() {
-    let mut request = Request::new();
+    let mut request = Request::new().unwrap();
     let err = request.set_option("a\0b", "c").unwrap_err();
     assert_eq!(err.kind(), ErrorKind::InvalidArgument);
     let err = request.set_audio(&[0.0; 3], 16_000, 2).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::InvalidArgument);
+}
+
+#[test]
+fn invalid_inputs_are_rejected_before_ffi() {
+    let mut request = Request::new().unwrap();
+    for (rate, channels) in [(0, 1), (16_000, 0), (u32::MAX, 1)] {
+        let err = request.set_audio(&[0.0; 4], rate, channels).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidArgument, "{rate} Hz / {channels} ch");
+    }
+    for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        assert_eq!(request.set_speaking_rate(value).unwrap_err().kind(), ErrorKind::InvalidArgument);
+        assert_eq!(request.set_pitch_shift(value).unwrap_err().kind(), ErrorKind::InvalidArgument);
+        assert_eq!(request.set_energy_scale(value).unwrap_err().kind(), ErrorKind::InvalidArgument);
+    }
+
+    let registry = Registry::new().unwrap();
+    let model = registry.load_model(model_path(), &ModelConfig::family("silero_vad"), None).unwrap();
+    for backend in [BackendConfig::default().threads(0), BackendConfig::default().device(-1)] {
+        let err = model.create_session("vad", Mode::Offline, &backend, None).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidArgument);
+    }
+    if model.supports("vad", Mode::Streaming) {
+        let mut session = model.create_session("vad", Mode::Streaming, &BackendConfig::default(), None).unwrap();
+        session.stream_start(None).unwrap();
+        for offset in [-1, i64::MAX] {
+            let err = session.stream_push(&[0.0; 512], 16_000, 1, offset).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidArgument, "offset {offset}");
+        }
+    }
 }
 
 #[test]
@@ -66,7 +95,7 @@ fn offline_vad() {
     let frames = samples.len() as i64 / channels as i64;
 
     let registry = Registry::new().unwrap();
-    assert!(registry.families().iter().any(|f| f == "silero_vad"));
+    assert!(registry.families().unwrap().iter().any(|f| f == "silero_vad"));
 
     let model = registry.load_model(model_path(), &ModelConfig::family("silero_vad"), None).unwrap();
     assert_eq!(model.family(), "silero_vad");
@@ -84,11 +113,11 @@ fn offline_vad() {
     drop(model);
     drop(registry);
 
-    let mut request = Request::new();
+    let mut request = Request::new().unwrap();
     request.set_audio(&samples, rate, channels).unwrap();
 
     let first = session.run(&request).unwrap();
-    let segments = first.segments();
+    let segments = first.segments().unwrap();
     assert!(!segments.is_empty(), "no speech found in a speech recording");
     let mut previous_end = -1;
     for segment in &segments {
@@ -97,12 +126,12 @@ fn offline_vad() {
         assert!(segment.start_sample >= previous_end);
         previous_end = segment.end_sample;
     }
-    assert!(first.audio().is_none(), "a VAD result carries no audio");
-    assert!(first.text().is_none());
+    assert!(first.audio().unwrap().is_none(), "a VAD result carries no audio");
+    assert!(first.text().unwrap().is_none());
 
     // Session reuse must be deterministic.
     let second = session.run(&request).unwrap();
-    assert_eq!(spans(&segments), spans(&second.segments()));
+    assert_eq!(spans(&segments), spans(&second.segments().unwrap()));
 }
 
 #[test]
@@ -130,16 +159,16 @@ fn streaming_vad() {
         chunk.resize(chunk_frames * channels as usize, 0.0);
         if let Some(event) = session.stream_push(&chunk, rate, channels, start).unwrap() {
             events += 1;
-            activity += event.voice_activity().len();
+            activity += event.voice_activity().unwrap().len();
         }
         while let Some(event) = session.stream_next_event().unwrap() {
             events += 1;
-            activity += event.voice_activity().len();
+            activity += event.voice_activity().unwrap().len();
         }
     }
     let result = session.stream_finish().unwrap();
     assert!(events > 0);
-    assert!(activity > 0 || !result.segments().is_empty(), "stream found no speech");
+    assert!(activity > 0 || !result.segments().unwrap().is_empty(), "stream found no speech");
 
     // Offline-only calls on a streaming session and vice versa fail cleanly.
     let offline = model.create_session("vad", Mode::Offline, &BackendConfig::default(), None).unwrap();
@@ -148,7 +177,7 @@ fn streaming_vad() {
 
 #[test]
 fn request_setters_accept_valid_input() {
-    let mut request = Request::new();
+    let mut request = Request::new().unwrap();
     request
         .set_text("hello", Some("en"))
         .unwrap()
