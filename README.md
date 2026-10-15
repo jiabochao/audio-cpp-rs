@@ -44,7 +44,7 @@ dropping the `Model` or `Registry` early is safe.
 ## Examples
 
 ```sh
-cargo run --example vad                       # bundled Silero VAD, no download needed
+cargo run --example vad                       # Silero VAD from tests/data, no model download needed
 cargo run --example inspect                   # families compiled into the library
 cargo run --example inspect -- <model> [family]
 cargo run --release --example tts -- <model> <family> "text" out.wav voice-id=...
@@ -55,49 +55,78 @@ Models come from the [audio.cpp GGUF repository](https://huggingface.co/audio-cp
 
 ## Building
 
-Clone with the submodule:
+Add it as a dependency (a git dependency works; no submodules involved):
 
-```sh
-git clone --recursive <this repo>
-# or, in an existing checkout:
-git submodule update --init
+```toml
+audio-cpp = { git = "<this repo>", features = ["cuda"] }
 ```
 
-By default, `audio-cpp-sys` builds `libaudiocpp` from the vendored source with
-CMake. This needs a C++17 compiler and CMake. The build always runs in Release
-mode.
+`audio-cpp-sys` gets `libaudiocpp` in this order:
+
+1. **`AUDIOCPP_LIB_DIR`**: if set, link the library in that directory and do
+   nothing else.
+2. **Prebuilt download**: fetch the upstream release archive
+   `audio-<tag>-lib-<platform>-<backend>` that matches the target and the
+   backend feature. The archive is checked against the sha256 digest GitHub
+   publishes and against the ABI version in its `audiocpp.h`.
+3. **Source build**: if no compatible archive exists, download the upstream
+   source at the commit pinned in `audio-cpp-sys/build.rs` and build it with
+   CMake. This needs a C++17 compiler and CMake, and always builds in Release
+   mode.
+
+> Upstream releases up to v0.9.1 ship no `-lib-` archives, so until the next
+> release step 2 always falls through to a source build.
+
+Prebuilt archives exist for:
+
+| target | archives |
+|---|---|
+| `x86_64-unknown-linux-gnu` | cpu, vulkan, cuda (+ `-portable` cpu/vulkan) |
+| `x86_64-pc-windows-msvc` | cpu, vulkan, cuda (+ `-portable` cpu/vulkan) |
+| `aarch64-apple-darwin`, `x86_64-apple-darwin` | metal |
+
+The `hip` feature, and any other target, always builds from source.
 
 | feature | effect |
 |---|---|
-| `openmp` (default) | `ENGINE_ENABLE_OPENMP` |
-| `native` (default) | ggml CPU kernels tuned for the host CPU. Turn it off for portable binaries. |
-| `cuda`, `hip`, `vulkan`, `metal` | GPU backends |
+| `cuda`, `vulkan`, `metal`, `hip` | GPU backend; also selects the prebuilt archive |
+| `openmp` (default) | source build only: `ENGINE_ENABLE_OPENMP` |
+| `native` (default) | source build only: ggml CPU kernels tuned for the host CPU |
 
 Environment variables:
 
 | variable | |
 |---|---|
-| `AUDIOCPP_LIB_DIR` | Link a prebuilt `libaudiocpp`, such as the `libs/` directory of an upstream `audio-<tag>-lib-*` release, and skip the CMake build |
-| `AUDIOCPP_MODEL_SET` | `full` (default), `core`, or `custom`. `core` builds much faster but includes only the bundled VAD models. |
+| `AUDIOCPP_BUILD` | `auto` (default: prebuilt, then source), `prebuilt` (fail instead of building), `source` (never download a binary) |
+| `AUDIOCPP_LIB_DIR` | Link an existing `libaudiocpp` and skip everything else |
+| `AUDIOCPP_RELEASE` | Release tag to download; default is the latest release |
+| `AUDIOCPP_CUDA_VERSION` | CUDA flavour of the archive, e.g. `12.8`; default is the oldest offered, which asks the least of the driver |
+| `AUDIOCPP_PORTABLE` | `1` selects the `-portable` archive, for CPUs without AVX2 |
+| `AUDIOCPP_GITHUB_API` | GitHub API base URL, for mirrors |
+| `GITHUB_TOKEN` | Optional; raises the GitHub API rate limit |
+| `AUDIOCPP_SRC_DIR` | Build from a local audio.cpp checkout instead of downloading the source |
+| `AUDIOCPP_MODEL_SET` | `full` (default), `core`, or `custom`. Setting it implies a source build. `core` builds much faster but includes only the bundled VAD models. |
 | `AUDIOCPP_MODELS` | Comma-separated model targets for `AUDIOCPP_MODEL_SET=custom` |
-| `AUDIOCPP_CMAKE_ARGS` | Extra `-DKEY=VALUE` arguments for CMake |
+| `AUDIOCPP_CMAKE_ARGS` | Extra `-DKEY=VALUE` arguments for CMake; implies a source build |
+
+With `cargo --offline`, nothing is downloaded: set `AUDIOCPP_LIB_DIR` or
+`AUDIOCPP_SRC_DIR`.
 
 `libaudiocpp` is always a shared library, because upstream builds the C ABI only
 that way. `cargo run` and `cargo test` find it on their own. To deploy, ship
-`libaudiocpp.so`, `.dylib` or `.dll` next to your executable or on the loader
-path. Build scripts of dependent crates can read its directory from
-`DEP_AUDIOCPP_LIB_DIR`.
+everything in its directory (a prebuilt archive bundles its runtime
+dependencies there) next to your executable or on the loader path. Build
+scripts of dependent crates can read that directory from `DEP_AUDIOCPP_LIB_DIR`.
 
 ## Updating audio.cpp
 
-```sh
-git -C audio-cpp-sys/audio.cpp fetch && git -C audio-cpp-sys/audio.cpp checkout <rev>
-scripts/gen-bindings.sh   # needs bindgen-cli and libclang
-cargo test
-```
+1. Set `SOURCE_COMMIT` in `audio-cpp-sys/build.rs` to the new commit.
+2. Copy that commit's `include/audiocpp.h` to `audio-cpp-sys/include/`.
+3. Run `scripts/gen-bindings.sh` (needs bindgen-cli and libclang).
+4. Run `cargo test`.
 
-At runtime, `Registry::new()` refuses a library whose ABI major differs from the
-bindings, or whose minor is older than the bindings.
+At runtime, `Registry::new()` also refuses a library whose ABI major differs
+from the bindings, or whose minor is older than the bindings.
 
 ## License
 

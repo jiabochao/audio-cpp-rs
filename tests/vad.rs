@@ -1,5 +1,5 @@
-//! End-to-end checks against Silero VAD, which ships inside the audio.cpp
-//! submodule together with a 16 kHz speech sample, so no download is needed.
+//! End-to-end checks against Silero VAD. The model and a 16 kHz speech sample
+//! are copied from upstream into `tests/data`, so no download is needed.
 //! Mirrors upstream `tests/capi/path_test.c`.
 
 use std::path::PathBuf;
@@ -9,16 +9,16 @@ use audio_cpp::{
     StreamInputKind,
 };
 
-fn upstream(path: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("audio-cpp-sys/audio.cpp").join(path)
+fn data(path: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data").join(path)
 }
 
 fn model_path() -> PathBuf {
-    upstream("assets/framework/models/silero_vad")
+    data("silero_vad")
 }
 
 fn load_sample() -> (Vec<f32>, u32, u32) {
-    let mut reader = hound::WavReader::open(upstream("assets/resources/sample_16k.wav")).unwrap();
+    let mut reader = hound::WavReader::open(data("sample_16k.wav")).unwrap();
     let spec = reader.spec();
     assert_eq!(spec.bits_per_sample, 16);
     let samples = reader.samples::<i16>().map(|s| s.unwrap() as f32 / 32768.0).collect();

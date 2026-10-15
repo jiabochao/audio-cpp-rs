@@ -1,4 +1,4 @@
-//! Voice activity detection with the Silero VAD model bundled in audio.cpp.
+//! Voice activity detection with Silero VAD. Defaults to the copy in tests/data.
 //!
 //! cargo run --example vad -- [model_dir] [input.wav]
 
@@ -7,10 +7,10 @@ use std::path::PathBuf;
 use audio_cpp::{BackendConfig, Mode, ModelConfig, Registry, Request};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let upstream = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("audio-cpp-sys/audio.cpp");
+    let data = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data");
     let mut args = std::env::args().skip(1);
-    let model = args.next().map_or_else(|| upstream.join("assets/framework/models/silero_vad"), PathBuf::from);
-    let input = args.next().map_or_else(|| upstream.join("assets/resources/sample_16k.wav"), PathBuf::from);
+    let model = args.next().map_or_else(|| data.join("silero_vad"), PathBuf::from);
+    let input = args.next().map_or_else(|| data.join("sample_16k.wav"), PathBuf::from);
 
     let (samples, rate, channels) = read_wav(&input)?;
     let registry = Registry::new()?;

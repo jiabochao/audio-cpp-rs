@@ -11,6 +11,12 @@ categories = ["external-ffi-bindings", "multimedia::audio"]
 
 [build-dependencies]
 cmake = "0.1"
+flate2 = "1"
+serde_json = "1"
+sha2 = "0.10"
+tar = "0.4"
+ureq = "3"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [features]
 default = ["openmp", "native"]

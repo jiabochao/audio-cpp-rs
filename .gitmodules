@@ -1,3 +1,0 @@
-[submodule "audio-cpp-sys/audio.cpp"]
-	path = audio-cpp-sys/audio.cpp
-	url = https://github.com/0xShug0/audio.cpp.git

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Regenerates audio-cpp-sys/src/bindings.rs from the vendored audiocpp.h.
+# Regenerates audio-cpp-sys/src/bindings.rs from audio-cpp-sys/include/audiocpp.h (copy it from the upstream commit pinned in build.rs).
 # Requires bindgen-cli (`cargo install bindgen-cli`) and libclang.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
-bindgen "$root/audio-cpp-sys/audio.cpp/include/audiocpp.h" \
+bindgen "$root/audio-cpp-sys/include/audiocpp.h" \
     --allowlist-function 'audiocpp_.*' \
     --allowlist-type 'audiocpp_.*' \
     --allowlist-var 'AUDIOCPP_.*' \
