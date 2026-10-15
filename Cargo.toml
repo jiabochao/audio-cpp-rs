@@ -6,6 +6,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
+repository = "https://github.com/jiabochao/audio-cpp-rs"
 
 [package]
 name = "audio-cpp"
@@ -14,6 +15,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 keywords = ["audio", "tts", "asr", "ggml", "speech"]
 categories = ["api-bindings", "multimedia::audio"]
 
