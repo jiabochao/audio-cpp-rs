@@ -51,6 +51,57 @@ const SOURCE_COMMIT: &str = "0097d365a00b52a6991ad7618f0a04e8d2935e47";
 /// Release whose prebuilt archives match [`SOURCE_COMMIT`]. `AUDIOCPP_RELEASE`
 /// overrides it; `latest` follows upstream's newest release instead.
 const PREBUILT_RELEASE: &str = "v0.9.2";
+/// Library and CUDA runtime archives of [`PREBUILT_RELEASE`] with their
+/// sha256, written by `scripts/pin-release.py`. Building against the pinned
+/// release needs no GitHub API call — anonymous calls are rate limited per IP,
+/// which CI runners and offices share — and checks archives against digests
+/// recorded here, not ones fetched alongside them.
+const PREBUILT_ASSETS: &[(&str, &str)] = &[
+    // BEGIN PREBUILT_ASSETS (generated)
+    (
+        "audio-v0.9.2-cudart-ubuntu-x64-cuda12.8.tar.gz",
+        "2a946a0e9f1278c9318bd4cc8cb2c8915ec966a8cb014795bcdf3fc7153da973",
+    ),
+    (
+        "audio-v0.9.2-cudart-ubuntu-x64-cuda13.3.tar.gz",
+        "7619300961d7a721f07de655cf2f5e5107c673a15ddacb0204ea9663f9f4253e",
+    ),
+    (
+        "audio-v0.9.2-cudart-windows-x64-cuda12.4.zip",
+        "50e278d213daa38e782a10b501b764c5c0738381898dacee7243101b890eeb0d",
+    ),
+    (
+        "audio-v0.9.2-cudart-windows-x64-cuda13.3.zip",
+        "f3bb616e43f4b8aec4be7f2c2b323aec381a1993bac382401a011c121c126e59",
+    ),
+    ("audio-v0.9.2-lib-macos-arm64-metal.tar.gz", "781939ba177f379b3bb6b3c9dfd056478d620ee63f783ef2b8119ec25d478571"),
+    ("audio-v0.9.2-lib-macos-x64-metal.tar.gz", "b931f2cbdad2de12e8f1fc3be7aa42c5c548d42cfe3a77878fe0ccdb308756a2"),
+    (
+        "audio-v0.9.2-lib-ubuntu-x64-cpu-portable.tar.gz",
+        "1769a744dddf452347b2a732b17c3e470d2daad0fb1b5051d91fd7dd93cd119d",
+    ),
+    ("audio-v0.9.2-lib-ubuntu-x64-cpu.tar.gz", "9caf953d5fa02eb9fb7690b5238ea5535b82d0b53cae3b31882f3e2260ef0d1c"),
+    ("audio-v0.9.2-lib-ubuntu-x64-cuda12.8.tar.gz", "d59dc4c612bfe0dc4f9b33161db30f33bf9afa9de6e7f73d37f9b212aa25e0c0"),
+    ("audio-v0.9.2-lib-ubuntu-x64-cuda13.3.tar.gz", "840ddf53bac3f3581817401c8d6a67557048a6f6a2f2319ee48be78db8af1737"),
+    (
+        "audio-v0.9.2-lib-ubuntu-x64-vulkan-portable.tar.gz",
+        "e2b020f319abd5451fde775cb581cb9b5291c08c5d91433c525521e777b6c57d",
+    ),
+    ("audio-v0.9.2-lib-ubuntu-x64-vulkan.tar.gz", "f08f93b39a4f002263e58883db0feea980975087b1a5ce4355671302f4528ba3"),
+    (
+        "audio-v0.9.2-lib-windows-x64-cpu-portable.zip",
+        "85bdbbe5f5c9b85cee1d59ba4e4d90db8902d07b9a16606b87d4cfb69d77a4f4",
+    ),
+    ("audio-v0.9.2-lib-windows-x64-cpu.zip", "c3839623692ec11df8c42f702faf5b03db68de2c09aa33d85e1a86f9038ab52f"),
+    ("audio-v0.9.2-lib-windows-x64-cuda12.4.zip", "88b3bd81cda3b49799e227ff7cb73d25568730be74bcc34705a53ef4537d9145"),
+    ("audio-v0.9.2-lib-windows-x64-cuda13.3.zip", "e85a6e4b7084140019776fbcf7e9827e69df5745b8a4af471b4fbc9a52e917d2"),
+    (
+        "audio-v0.9.2-lib-windows-x64-vulkan-portable.zip",
+        "285f7e95e053807bd52cd888baa2d8a9fd1f9845305e2f17716987ffca472988",
+    ),
+    ("audio-v0.9.2-lib-windows-x64-vulkan.zip", "01c080d1455d4e10df4fab46f99d1a7b9119ea703db323c5691d08ffbad77afa"),
+    // END PREBUILT_ASSETS
+];
 /// Bumped when the layout of cached builds changes.
 const CACHE_LAYOUT: u32 = 1;
 
@@ -388,13 +439,12 @@ fn download_prebuilt() -> Result<PathBuf, BoxError> {
         return Err("offline, and no matching prebuilt archive is cached".into());
     }
 
-    let release = github_release()?;
-    let tag = release["tag_name"].as_str().ok_or("release has no tag_name")?;
-    let assets = release["assets"].as_array().ok_or("release has no assets")?;
-    let asset_named = |name: &str| assets.iter().find(|a| a["name"].as_str() == Some(name));
+    let (tag, assets) = release_assets(&wanted)?;
+    let tag = tag.as_str();
+    let asset_named = |name: &str| assets.iter().find(|a| a.name == name);
 
     let (flavour, cudart) = if backend == "cuda" {
-        let version = cuda_version(assets, tag, platform, ext)?;
+        let version = cuda_version(&assets, tag, platform, ext)?;
         (format!("cuda{version}"), Some(format!("audio-{tag}-cudart-{platform}-cuda{version}.{ext}")))
     } else if portable && backend != "metal" {
         (format!("{backend}-portable"), None)
@@ -403,7 +453,7 @@ fn download_prebuilt() -> Result<PathBuf, BoxError> {
     };
     let name = format!("audio-{tag}-lib-{platform}-{flavour}.{ext}");
     let asset = asset_named(&name).ok_or_else(|| format!("release {tag} has no {name}"))?;
-    let digest = asset["digest"].as_str().and_then(|d| d.strip_prefix("sha256:")).map(str::to_ascii_lowercase);
+    let digest = asset.digest.clone();
 
     // Keyed by digest, so a re-uploaded asset is a different entry.
     let stem = name.trim_end_matches(&format!(".{ext}")).to_string();
@@ -415,11 +465,10 @@ fn download_prebuilt() -> Result<PathBuf, BoxError> {
             fs::remove_dir_all(&dir)?;
         }
         fs::create_dir_all(&dir)?;
-        fetch_asset(asset, digest.as_deref(), &dir)?;
+        fetch_asset(asset, &dir)?;
         if let Some(cudart) = cudart {
             let asset = asset_named(&cudart).ok_or_else(|| format!("release {tag} has no {cudart}"))?;
-            let digest = asset["digest"].as_str().and_then(|d| d.strip_prefix("sha256:")).map(str::to_ascii_lowercase);
-            fetch_asset(asset, digest.as_deref(), &dir.join("libs"))?;
+            fetch_asset(asset, &dir.join("libs"))?;
         }
         check_abi(&dir.join("include/audiocpp.h"))?;
         if !has_library(&dir.join("libs")) {
@@ -449,13 +498,50 @@ fn cached_prebuilt(cache: &Path, tag: &str, platform: &str, backend: &str, porta
         .map(|p| p.join("libs"))
 }
 
-fn cuda_version(assets: &[serde_json::Value], tag: &str, platform: &str, ext: &str) -> Result<String, BoxError> {
+/// A downloadable archive of a release.
+struct Asset {
+    name: String,
+    url: String,
+    /// Lowercase hex sha256, when known.
+    digest: Option<String>,
+}
+
+/// The archives of release `wanted`: from [`PREBUILT_ASSETS`] for the pinned
+/// release, otherwise from the GitHub API.
+fn release_assets(wanted: &str) -> Result<(String, Vec<Asset>), BoxError> {
+    if wanted == PREBUILT_RELEASE && !PREBUILT_ASSETS.is_empty() {
+        let assets = PREBUILT_ASSETS
+            .iter()
+            .map(|(name, digest)| Asset {
+                name: name.to_string(),
+                url: format!("https://github.com/{UPSTREAM}/releases/download/{wanted}/{name}"),
+                digest: Some(digest.to_string()),
+            })
+            .collect();
+        return Ok((wanted.to_string(), assets));
+    }
+    let release = github_release()?;
+    let tag = release["tag_name"].as_str().ok_or("release has no tag_name")?.to_string();
+    let assets = release["assets"]
+        .as_array()
+        .ok_or("release has no assets")?
+        .iter()
+        .filter_map(|a| {
+            Some(Asset {
+                name: a["name"].as_str()?.to_string(),
+                url: a["browser_download_url"].as_str()?.to_string(),
+                digest: a["digest"].as_str().and_then(|d| d.strip_prefix("sha256:")).map(str::to_ascii_lowercase),
+            })
+        })
+        .collect();
+    Ok((tag, assets))
+}
+
+fn cuda_version(assets: &[Asset], tag: &str, platform: &str, ext: &str) -> Result<String, BoxError> {
     let prefix = format!("audio-{tag}-lib-{platform}-cuda");
     let suffix = format!(".{ext}");
-    let mut offered: Vec<String> = assets
-        .iter()
-        .filter_map(|a| a["name"].as_str()?.strip_prefix(&prefix)?.strip_suffix(&suffix).map(str::to_string))
-        .collect();
+    let mut offered: Vec<String> =
+        assets.iter().filter_map(|a| a.name.strip_prefix(&prefix)?.strip_suffix(&suffix).map(str::to_string)).collect();
     if offered.is_empty() {
         return Err(format!("release {tag} has no CUDA archive for {platform}").into());
     }
@@ -483,21 +569,19 @@ fn github_release() -> Result<serde_json::Value, BoxError> {
     Ok(serde_json::from_str(&body)?)
 }
 
-/// Downloads a release asset, verifies its sha256 when GitHub publishes one,
-/// and unpacks it into `dest`.
-fn fetch_asset(asset: &serde_json::Value, digest: Option<&str>, dest: &Path) -> Result<(), BoxError> {
-    let name = asset["name"].as_str().ok_or("asset has no name")?;
-    let url = asset["browser_download_url"].as_str().ok_or("asset has no download url")?;
+/// Downloads a release asset, verifies its sha256 when known, and unpacks it
+/// into `dest`.
+fn fetch_asset(asset: &Asset, dest: &Path) -> Result<(), BoxError> {
     fs::create_dir_all(dest)?;
-    let archive = dest.join(name);
-    let actual = download(url, &archive)?;
-    match digest {
+    let archive = dest.join(&asset.name);
+    let actual = download(&asset.url, &archive)?;
+    match asset.digest.as_deref() {
         Some(expected) if expected == actual => {}
         Some(expected) => {
             fs::remove_file(&archive).ok();
-            return Err(format!("{name}: sha256 {actual} does not match published {expected}").into());
+            return Err(format!("{}: sha256 {actual} does not match {expected}", asset.name).into());
         }
-        None => println!("cargo:warning={name}: release publishes no digest; not verified"),
+        None => println!("cargo:warning={}: release publishes no digest; not verified", asset.name),
     }
     unpack(&archive, dest)?;
     fs::remove_file(&archive).ok();
@@ -590,6 +674,7 @@ fn build_key(defines: &[(String, String)]) -> String {
 
 fn cmake_defines() -> Vec<(String, String)> {
     let on_off = |enabled: bool| if enabled { "ON" } else { "OFF" }.to_string();
+    let macos = env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "macos");
     let mut defines = vec![
         ("AUDIOCPP_BUILD_C_API".into(), "ON".into()),
         // Compile model specs into the library, so it does not look for a
@@ -598,8 +683,12 @@ fn cmake_defines() -> Vec<(String, String)> {
         ("ENGINE_ENABLE_CUDA".into(), on_off(feature("cuda"))),
         ("ENGINE_ENABLE_HIP".into(), on_off(feature("hip"))),
         ("ENGINE_ENABLE_VULKAN".into(), on_off(feature("vulkan"))),
-        ("ENGINE_ENABLE_METAL".into(), on_off(feature("metal"))),
-        ("ENGINE_ENABLE_OPENMP".into(), on_off(feature("openmp"))),
+        // Metal is how audio.cpp runs on a Mac, and what the prebuilt macOS
+        // archives carry, so it is on there whether or not the feature is.
+        ("ENGINE_ENABLE_METAL".into(), on_off(feature("metal") || macos)),
+        // Apple's compilers ship no OpenMP runtime; upstream's macOS builds
+        // go without it too.
+        ("ENGINE_ENABLE_OPENMP".into(), on_off(feature("openmp") && !macos)),
         ("ENGINE_ENABLE_NATIVE_CPU".into(), on_off(feature("native"))),
         ("ENGINE_BUILD_EXAMPLES".into(), "OFF".into()),
         ("ENGINE_BUILD_TESTS".into(), "OFF".into()),

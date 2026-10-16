@@ -3,7 +3,8 @@
 #
 #   scripts/update-upstream.sh [<commit>|<branch>|<tag>]
 #
-# A tag (v0.9.3) also becomes the default prebuilt release (PREBUILT_RELEASE);
+# A tag (v0.9.3) also becomes the pinned prebuilt release (PREBUILT_RELEASE and
+# its archive digests, via scripts/pin-release.py);
 # a branch or commit leaves the prebuilt release alone.
 #
 # Fetches that commit, copies its audiocpp.h, regenerates the bindings and the
@@ -47,10 +48,10 @@ fi
 
 cp "$work/include/audiocpp.h" "$root/audio-cpp-sys/include/audiocpp.h"
 sed -i.bak "s/^const SOURCE_COMMIT: &str = \"[0-9a-f]\{40\}\";$/const SOURCE_COMMIT: \&str = \"$commit\";/" "$root/audio-cpp-sys/build.rs"
-if [[ -n "$tag" ]]; then
-    sed -i.bak "s/^const PREBUILT_RELEASE: &str = \"[^\"]*\";$/const PREBUILT_RELEASE: \&str = \"$tag\";/" "$root/audio-cpp-sys/build.rs"
-fi
 rm -f "$root/audio-cpp-sys/build.rs.bak"
 "$root/scripts/gen-bindings.sh"
 python3 "$root/scripts/sync-catalog.py" "$work"
+if [[ -n "$tag" ]]; then
+    python3 "$root/scripts/pin-release.py" "$tag"
+fi
 echo "updated ${current:0:12} -> ${commit:0:12}"

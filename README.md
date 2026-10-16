@@ -130,8 +130,12 @@ piece by piece.
 
 The prebuilt release is pinned to the one matching the source commit
 (currently **v0.9.2**, upstream's first release with library archives), so a
-build is reproducible and, once cached, needs no network. Set
-`AUDIOCPP_RELEASE=latest` to follow upstream instead.
+build is reproducible and, once cached, needs no network. The pinned
+release's archive names and sha256 digests are recorded in `build.rs`
+(`scripts/pin-release.py`), so it downloads without touching the GitHub API —
+whose anonymous rate limit CI runners and offices share — and verifies
+against digests that cannot change under it. Set `AUDIOCPP_RELEASE=latest` to
+follow upstream instead.
 
 Downloads and native builds live in a **persistent cache** keyed by
 everything that affects them (commit, target, features, model set, compiler
@@ -142,8 +146,8 @@ a cache hit takes seconds. Concurrent builds coordinate with file locks.
 
 | feature | |
 |---|---|
-| `cuda`, `vulkan`, `metal`, `hip` | GPU backend; also selects the prebuilt archive |
-| `openmp` (default) | source builds: OpenMP |
+| `cuda`, `vulkan`, `metal`, `hip` | GPU backend; also selects the prebuilt archive. Metal is always on for macOS |
+| `openmp` (default) | source builds: OpenMP (not on macOS, whose compilers lack it) |
 | `native` | source builds: CPU kernels for the build machine only (faster, not portable) |
 | `catalog` (default), `wav` (default), `resample` | see above |
 | `decode` | `AudioBuffer::decode_file`: MP3, AAC/M4A, FLAC, Ogg Vorbis, AIFF, ALAC, CAF |

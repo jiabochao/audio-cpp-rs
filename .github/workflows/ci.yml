@@ -14,6 +14,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # Only `AUDIOCPP_RELEASE=latest` and other unpinned tags query the GitHub
+  # API; a token keeps those off the shared anonymous rate limit.
+  GITHUB_TOKEN: ${{ github.token }}
 
 jobs:
   lint:

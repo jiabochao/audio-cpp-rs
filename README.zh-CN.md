@@ -96,7 +96,7 @@ for file in package.files()? {
 2. **下载预编译包**：按目标平台和后端特性下载上游 release 中的 `audio-<tag>-lib-<platform>-<backend>`，用 GitHub 公布的 sha256 校验，并检查包内头文件的 ABI 版本。
 3. **源码构建**：下载 `audio-cpp-sys/build.rs` 中固定 commit 的上游源码，用 CMake 构建（需要 C++17 编译器和 CMake）。下载的头文件必须与绑定完全一致。
 
-预编译包固定使用与源码 commit 对应的 release（目前是 **v0.9.2**，这是上游第一个带 lib 包的版本）。这样构建结果可以复现，而且缓存之后不需要联网。如果想跟随上游最新版，设置 `AUDIOCPP_RELEASE=latest`。
+预编译包固定使用与源码 commit 对应的 release（目前是 **v0.9.2**，这是上游第一个带 lib 包的版本）。这样构建结果可以复现，而且缓存之后不需要联网。固定版本的包名和 sha256 记录在 `build.rs` 里（由 `scripts/pin-release.py` 生成）。所以下载时完全不调用 GitHub API，不受 CI 机器和办公网络共用的匿名限额影响；校验用的 digest 也是固定的，不会随下载一起被替换。如果想跟随上游最新版，设置 `AUDIOCPP_RELEASE=latest`。
 
 下载内容和编译产物存放在**持久缓存**里，缓存键包含所有会影响产物的因素：commit、目标平台、特性、模型集、编译器参数。缓存位置：
 
@@ -108,8 +108,8 @@ for file in package.files()? {
 
 | 特性 | 说明 |
 |---|---|
-| `cuda`、`vulkan`、`metal`、`hip` | 启用 GPU 后端，同时决定下载哪个预编译包 |
-| `openmp`（默认） | 源码构建时启用 OpenMP |
+| `cuda`、`vulkan`、`metal`、`hip` | 启用 GPU 后端，同时决定下载哪个预编译包。macOS 上始终启用 Metal |
+| `openmp`（默认） | 源码构建时启用 OpenMP（macOS 除外，苹果的编译器不带 OpenMP） |
 | `native` | 源码构建时按本机 CPU 指令集编译。更快，但产物只能在同类 CPU 上运行 |
 | `catalog`（默认）、`wav`（默认）、`resample` | 见上文 |
 | `decode` | `AudioBuffer::decode_file`：解码 MP3、AAC/M4A、FLAC、Ogg Vorbis、AIFF、ALAC、CAF |
