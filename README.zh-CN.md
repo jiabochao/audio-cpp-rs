@@ -122,7 +122,7 @@ for file in package.files()? {
 | `AUDIOCPP_OFFLINE` | 设为 `1` 时禁止联网。`cargo --offline` 不一定会传递给构建脚本，所以需要这个开关 |
 | `AUDIOCPP_RELEASE` | 要下载的 release tag，或设为 `latest`；默认使用固定的版本（v0.9.2） |
 | `AUDIOCPP_CUDA_VERSION` | CUDA 版本，例如 `12.8`；默认取最旧的版本，对显卡驱动要求最低 |
-| `AUDIOCPP_PORTABLE` | 设为 `1` 时选择 `-portable` 包，适用于不支持 AVX2 的 CPU |
+| `AUDIOCPP_PORTABLE` | 默认开启：使用 `-portable` 的 CPU/Vulkan 包，任何 x86-64 CPU 都能运行。设为 `0` 时改用按上游构建机 CPU 调优的包：CPU 推理更快，但在缺少相应指令集的 CPU 上会因非法指令而崩溃 |
 | `AUDIOCPP_GITHUB_API`、`GITHUB_TOKEN` | API 镜像地址；提高 API 调用限额 |
 | `AUDIOCPP_SRC_DIR` | 从本地 audio.cpp 源码构建（会检查 ABI，不进入缓存） |
 | `AUDIOCPP_MODEL_SET` | `full`（默认）、`core`（只含 VAD，几分钟编完）、`custom`；设置后强制源码构建 |

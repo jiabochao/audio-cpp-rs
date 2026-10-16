@@ -25,7 +25,7 @@
 //! | `AUDIOCPP_OFFLINE` | `1` forbids network access (also `CARGO_NET_OFFLINE=true`) |
 //! | `AUDIOCPP_RELEASE` | release tag to download, or `latest`; default [`PREBUILT_RELEASE`] |
 //! | `AUDIOCPP_CUDA_VERSION` | CUDA flavour of the archive, e.g. `12.8`; default the oldest |
-//! | `AUDIOCPP_PORTABLE` | `1` selects the `-portable` (no AVX2) CPU/Vulkan archive |
+//! | `AUDIOCPP_PORTABLE` | `0` selects the CPU/Vulkan archives tuned to upstream's build machine instead of the `-portable` ones |
 //! | `AUDIOCPP_GITHUB_API` | GitHub API base URL, for mirrors |
 //! | `GITHUB_TOKEN` | raises the GitHub API rate limit |
 //! | `AUDIOCPP_SRC_DIR` | build from a local audio.cpp tree (not cached) |
@@ -424,7 +424,13 @@ fn download_prebuilt() -> Result<PathBuf, BoxError> {
         (["vulkan"], false) => "vulkan",
         _ => return Err(format!("no prebuilt archive for features {gpu:?} on {platform}").into()),
     };
-    let portable = truthy("AUDIOCPP_PORTABLE");
+    // Upstream's non-portable CPU and Vulkan archives are compiled for the
+    // CPU of the machine that built them (ENGINE_ENABLE_NATIVE_CPU defaults
+    // on), and crash with an illegal instruction on older CPUs — seen on
+    // GitHub's own Windows runners. The portable ones dispatch at run time
+    // (Linux) or target baseline x86-64 (Windows), so they are the default;
+    // AUDIOCPP_PORTABLE=0 opts into the tuned ones for a known machine.
+    let portable = env::var("AUDIOCPP_PORTABLE").map_or(true, |_| truthy("AUDIOCPP_PORTABLE"));
     let ext = if target_os == "windows" { "zip" } else { "tar.gz" };
 
     // A pinned tag that is already cached needs no network at all.

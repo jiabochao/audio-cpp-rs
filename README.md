@@ -160,7 +160,7 @@ a cache hit takes seconds. Concurrent builds coordinate with file locks.
 | `AUDIOCPP_OFFLINE` | `1` forbids network access (`cargo --offline` is not visible to build scripts) |
 | `AUDIOCPP_RELEASE` | release tag to download, or `latest`; default the pinned release (v0.9.2) |
 | `AUDIOCPP_CUDA_VERSION` | CUDA flavour, e.g. `12.8`; default the oldest, which asks least of the driver |
-| `AUDIOCPP_PORTABLE` | `1` selects the `-portable` archive (no AVX2) |
+| `AUDIOCPP_PORTABLE` | Default on: the `-portable` CPU/Vulkan archives, which run on any x86-64 CPU. `0` selects the archives tuned to upstream's build machine — faster on CPU, but they crash with an illegal instruction on CPUs that lack its extensions |
 | `AUDIOCPP_GITHUB_API`, `GITHUB_TOKEN` | API mirror; higher rate limit |
 | `AUDIOCPP_SRC_DIR` | build a local audio.cpp tree (ABI-checked, not cached) |
 | `AUDIOCPP_MODEL_SET` | `full` (default), `core` (VAD only, minutes), `custom`; implies a source build |
