@@ -3,8 +3,10 @@ use std::marker::{PhantomData, PhantomPinned};
 use std::ops::Deref;
 use std::ptr;
 
+use crate::audio::AudioRef;
 use crate::error::{Error, ErrorKind, Result, check};
-use crate::{handle, owned_string, sys};
+use crate::ffi::{handle, owned_string};
+use crate::sys;
 
 /// Kinds of opaque payloads a family produces or consumes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -52,26 +54,6 @@ impl ArtifactKind {
             sys::AUDIOCPP_ARTIFACT_CUSTOM => Self::Custom,
             other => Self::Other(other as u32),
         }
-    }
-}
-
-/// Borrowed interleaved float PCM.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct AudioRef<'a> {
-    /// `frames() * channels` interleaved samples.
-    pub samples: &'a [f32],
-    pub sample_rate: u32,
-    pub channels: u32,
-}
-
-impl AudioRef<'_> {
-    /// Samples per channel.
-    pub fn frames(&self) -> usize {
-        self.samples.len() / self.channels.max(1) as usize
-    }
-
-    pub fn duration_secs(&self) -> f64 {
-        if self.sample_rate == 0 { 0.0 } else { self.frames() as f64 / self.sample_rate as f64 }
     }
 }
 
@@ -346,7 +328,7 @@ impl std::fmt::Debug for ResultView {
 
 handle!(
     /// An owned task result. Dereferences to [`ResultView`] for its contents.
-    TaskResult,
+    pub TaskResult,
     sys::audiocpp_result,
     sys::audiocpp_result_free
 );

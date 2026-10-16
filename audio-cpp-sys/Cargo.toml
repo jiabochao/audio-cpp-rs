@@ -13,11 +13,18 @@ categories = ["external-ffi-bindings", "multimedia::audio"]
 [build-dependencies]
 cmake = "0.1"
 flate2 = "1"
+fs4 = { version = "0.13", features = ["sync"] }
 serde_json = "1"
 sha2 = "0.10"
 tar = "0.4"
 ureq = "3"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+flate2 = "1"
+
+[[test]]
+name = "archive"
+path = "build/archive.rs"
 
 [features]
 default = ["openmp"]

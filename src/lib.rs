@@ -1,73 +1,111 @@
 //! Safe Rust bindings for [audio.cpp](https://github.com/0xShug0/audio.cpp),
-//! a ggml-based local audio inference framework (TTS, voice cloning, ASR, VAD,
-//! diarization, source separation, music generation, ...).
-//!
-//! The API mirrors the upstream C ABI (`include/audiocpp.h`):
+//! a ggml-based local audio inference framework: TTS, voice cloning and
+//! design, ASR, VAD, diarization, separation, music generation and more,
+//! on CPU, CUDA, HIP, Vulkan and Metal.
 //!
 //! ```text
-//! Registry ──load_model──▶ Model ──create_session──▶ Session ──run(&Request)──▶ TaskResult
+//! Registry ─load_model─▶ Model ─offline_session───▶ OfflineSession ─run(&Request)─▶ TaskResult
+//!                              └streaming_session─▶ StreamingSession ─start/push/next_event/finish
 //! ```
 //!
-//! Every handle keeps its parent alive internally, so a [`Session`] stays
-//! usable after its [`Model`] and [`Registry`] are dropped.
-//!
 //! ```no_run
-//! use audio_cpp::{Backend, BackendConfig, Mode, ModelConfig, Registry, Request};
+//! use audio_cpp::{Backend, BackendConfig, ModelConfig, Registry, Request, Task};
 //!
 //! # fn main() -> audio_cpp::Result<()> {
 //! let registry = Registry::new()?;
-//! let model = registry.load_model(
-//!     "models/kokoro-82m-q8_0.gguf",
-//!     &ModelConfig::family("kokoro_tts"),
-//!     None,
-//! )?;
-//! let mut session = model.create_session(
-//!     "tts",
-//!     Mode::Offline,
-//!     &BackendConfig::new(Backend::Cpu),
-//!     None,
-//! )?;
+//! let model = registry.load_model("models/Kokoro-82M-GGUF", &ModelConfig::family("kokoro_tts"), None)?;
+//! let mut session = model.offline_session(Task::Tts, &BackendConfig::new(Backend::Best), None)?;
 //!
-//! let mut request = Request::new()?;
-//! request
-//!     .set_text("Hello from audio.cpp.", Some("en-us"))?
-//!     .set_option("voice-id", "af_heart")?;
+//! let mut request = Request::with_text("Hello from audio.cpp.")?;
+//! request.set_option("voice_id", "af_heart")?;
 //!
 //! let result = session.run(&request)?;
 //! if let Some(audio) = result.audio()? {
-//!     println!("{} frames at {} Hz", audio.frames(), audio.sample_rate);
+//!     println!("{:?} of audio at {} Hz", audio.duration(), audio.sample_rate);
 //! }
 //! # Ok(())
 //! # }
 //! ```
 //!
+//! # Resources
+//!
+//! A [`Model`] is cheap: parsed config plus a mapping of the weight files.
+//! Every session uploads its own copy of the weights to the compute device,
+//! so create few sessions and reuse them. [`SessionPool`] does that for an
+//! application: it keeps sessions warm, bounds how many are resident, and
+//! evicts the least recently used.
+//!
 //! # Threading
 //!
-//! Handles are [`Send`] but not [`Sync`]: each may move between threads but
-//! must not be used from two threads at once. Separate handles may run
-//! concurrently.
+//! Handles are [`Send`] but not [`Sync`]: a session can move to a worker
+//! thread, but one handle is never used from two threads at once. Separate
+//! sessions run in parallel. Session creation is serialized process-wide
+//! because concurrent creation crashes upstream.
+//!
+//! ```compile_fail
+//! fn share<T: Sync>(_: &T) {}
+//! fn check(session: &audio_cpp::OfflineSession) { share(session) }
+//! ```
+//! ```compile_fail
+//! fn share<T: Sync>(_: &T) {}
+//! fn check(model: &audio_cpp::Model) { share(model) }
+//! ```
+//! ```compile_fail
+//! // Audio borrowed from a result cannot outlive it.
+//! fn leak(result: audio_cpp::TaskResult) -> &'static [f32] {
+//!     result.audio().unwrap().unwrap().samples
+//! }
+//! ```
+//!
+//! # Streaming
+//!
+//! Audio-input families (ASR, VAD, diarization) stream incrementally:
+//! [`StreamingSession::push`] returns events as audio arrives. Text-driven
+//! families (TTS) currently generate the whole utterance inside
+//! [`StreamingSession::start`], because the C ABI carries no callback for
+//! their incremental audio; split long text and run it piece by piece to get
+//! progress and cancellation points.
+//!
+//! # Features
+//!
+//! - `catalog` (default): the embedded upstream model catalog, [`catalog`].
+//! - `wav` (default): [`AudioBuffer`] WAV reading and writing.
+//! - `decode`: [`AudioBuffer::decode_file`] for MP3, AAC/M4A, FLAC, Ogg Vorbis,
+//!   AIFF, ALAC and CAF.
+//! - `resample`: [`AudioBuffer::resample`].
+//! - `cuda`, `hip`, `vulkan`, `metal`: GPU backends for the native library.
+//! - `openmp` (default), `native`: native build options; see `audio-cpp-sys`.
 
-// C enums are `c_uint` on most targets but `c_int` on MSVC, so the casts
-// that look redundant here are not redundant everywhere.
+// C enums are `c_uint` on most targets but `c_int` on MSVC, so casts that
+// look redundant here are not redundant everywhere.
 #![allow(clippy::unnecessary_cast)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
+mod audio;
+#[cfg(feature = "catalog")]
+pub mod catalog;
 mod error;
+mod ffi;
 mod model;
+mod pool;
 mod request;
 mod result;
 mod session;
-
-use std::ffi::{CStr, CString, c_char};
+mod task;
 
 pub use audio_cpp_sys as sys;
 
+pub use audio::{AudioBuffer, AudioRef};
 pub use error::{Error, ErrorKind, Result};
-pub use model::{Backend, BackendConfig, Mode, Model, ModelConfig, OptionInfo, OptionScope, Options, Registry};
+pub use model::{Model, ModelConfig, ModelInfo, OptionInfo, OptionScope, Options, Registry};
+pub use pool::{CancelToken, ModelConfigKey, PoolConfig, PoolStats, PooledSession, SessionPool, SessionSpec};
 pub use request::Request;
-pub use result::{
-    ArtifactKind, ArtifactRef, AudioRef, NamedAudio, ResultView, Segment, SpeakerTurn, TaskResult, Text, Word,
+pub use result::{ArtifactKind, ArtifactRef, NamedAudio, ResultView, Segment, SpeakerTurn, TaskResult, Text, Word};
+pub use session::{
+    Event, OfflineSession, StreamInputKind, StreamOutputKind, StreamPolicy, StreamingSession, VoiceActivity,
+    VoiceActivityKind,
 };
-pub use session::{Event, Session, StreamInputKind, StreamOutputKind, StreamPolicy, VoiceActivity, VoiceActivityKind};
+pub use task::{Backend, BackendConfig, Mode, Task};
 
 /// A packed ABI version, as reported by `audiocpp_abi_version()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -107,107 +145,5 @@ pub fn abi_version() -> AbiVersion {
 /// audio.cpp's own build version string, e.g. `"0.9.1"`.
 pub fn build_version() -> &'static str {
     // SAFETY: static lifetime per the header.
-    unsafe { static_str(sys::audiocpp_build_version()) }
-}
-
-/// The canonical task tokens this build accepts (`"tts"`, `"asr"`, `"vad"`, ...).
-pub fn tasks() -> Vec<&'static str> {
-    // SAFETY: no preconditions; names are static.
-    let count = unsafe { sys::audiocpp_task_count() };
-    (0..count)
-        .filter_map(|i| {
-            let name = unsafe { sys::audiocpp_task_name(i) };
-            (!name.is_null()).then(|| unsafe { static_str(name) })
-        })
-        .collect()
-}
-
-/// Maps a model-spec task name to the canonical token (`"music"` → `"gen"`).
-/// `None` when the name is no task this build can serve.
-pub fn task_from_spec_name(spec_task: &str) -> Option<&'static str> {
-    let spec_task = CString::new(spec_task).ok()?;
-    // SAFETY: valid C string; result is static or NULL.
-    let name = unsafe { sys::audiocpp_task_from_spec_name(spec_task.as_ptr()) };
-    (!name.is_null()).then(|| unsafe { static_str(name) })
-}
-
-/// Converts a Rust string to a C string, rejecting interior NULs.
-pub(crate) fn c_string(value: &str, what: &str) -> Result<CString> {
-    CString::new(value).map_err(|_| Error::invalid_argument(format!("{what} contains a NUL byte")))
-}
-
-pub(crate) fn opt_c_string(value: Option<&str>, what: &str) -> Result<Option<CString>> {
-    value.map(|v| c_string(v, what)).transpose()
-}
-
-pub(crate) fn opt_ptr(value: &Option<CString>) -> *const c_char {
-    value.as_ref().map_or(std::ptr::null(), |v| v.as_ptr())
-}
-
-/// Copies a borrowed C string. NULL reads as empty.
-///
-/// # Safety
-/// `ptr` must be NULL or a valid NUL-terminated string.
-pub(crate) unsafe fn owned_string(ptr: *const c_char) -> String {
-    if ptr.is_null() {
-        return String::new();
-    }
-    unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
-}
-
-/// # Safety
-/// `ptr` must be a valid NUL-terminated string with static lifetime.
-unsafe fn static_str(ptr: *const c_char) -> &'static str {
-    if ptr.is_null() {
-        return "";
-    }
-    unsafe { CStr::from_ptr(ptr) }.to_str().unwrap_or("")
-}
-
-/// Declares an owning wrapper around a C handle with a matching free function.
-macro_rules! handle {
-    ($(#[$meta:meta])* $name:ident, $raw:ty, $free:path) => {
-        $(#[$meta])*
-        pub struct $name {
-            ptr: std::ptr::NonNull<$raw>,
-        }
-
-        impl $name {
-            /// # Safety
-            /// `ptr` must be a live handle whose ownership is transferred.
-            #[allow(dead_code)]
-            pub(crate) unsafe fn from_raw(ptr: std::ptr::NonNull<$raw>) -> Self {
-                Self { ptr }
-            }
-
-            /// The underlying C handle. Still owned by `self`.
-            pub fn as_ptr(&self) -> *mut $raw {
-                self.ptr.as_ptr()
-            }
-        }
-
-        impl Drop for $name {
-            fn drop(&mut self) {
-                // SAFETY: we own the handle and free it exactly once.
-                unsafe { $free(self.ptr.as_ptr()) }
-            }
-        }
-
-        // SAFETY: handles carry no thread affinity; the C ABI only forbids
-        // concurrent use of one handle, which `!Sync` already prevents.
-        unsafe impl Send for $name {}
-    };
-}
-pub(crate) use handle;
-
-/// Runs a constructor that writes an out handle, wrapping the result.
-pub(crate) fn create<T, R>(
-    f: impl FnOnce(*mut *mut T) -> sys::audiocpp_status,
-    wrap: impl FnOnce(std::ptr::NonNull<T>) -> R,
-) -> Result<R> {
-    let mut out: *mut T = std::ptr::null_mut();
-    error::check(f(&mut out))?;
-    std::ptr::NonNull::new(out)
-        .map(wrap)
-        .ok_or_else(|| Error::new(ErrorKind::Runtime, "call succeeded but returned no handle"))
+    unsafe { ffi::static_str(sys::audiocpp_build_version()) }
 }

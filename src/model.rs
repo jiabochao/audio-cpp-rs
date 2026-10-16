@@ -4,13 +4,15 @@ use std::ptr::{self, NonNull};
 use std::sync::{Mutex, PoisonError};
 
 use crate::error::{Error, ErrorKind, Result, check};
-use crate::session::Session;
-use crate::{AbiVersion, abi_version, c_string, create, handle, opt_c_string, opt_ptr, owned_string, sys};
+use crate::ffi::{allocation_failed, c_string, create, handle, opt_c_string, opt_ptr, owned_string};
+use crate::session::{OfflineSession, StreamingSession};
+use crate::task::{BackendConfig, Mode, Task};
+use crate::{AbiVersion, abi_version, sys};
 
 handle!(
     /// A `string -> string` option map, passed to model loading
     /// (`--load-option`) and session creation (`--session-option`).
-    Options,
+    pub Options,
     sys::audiocpp_options,
     sys::audiocpp_options_free
 );
@@ -40,10 +42,25 @@ impl Options {
     }
 }
 
-/// Constructors that return a bare pointer do not set `audiocpp_last_error`,
-/// so reading it after one fails would report an unrelated, stale message.
-pub(crate) fn allocation_failed(what: &str) -> Error {
-    Error::new(ErrorKind::OutOfMemory, format!("failed to allocate {what}"))
+fn options_ptr(options: Option<&Options>) -> *const sys::audiocpp_options {
+    options.map_or(ptr::null(), |o| o.as_ptr())
+}
+
+pub(crate) fn path_c_string(path: &Path) -> Result<CString> {
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    };
+    // The library decodes paths as UTF-8 on Windows, so a non-UTF-8 path
+    // could only name the wrong file.
+    #[cfg(not(unix))]
+    let bytes = path
+        .to_str()
+        .ok_or_else(|| Error::invalid_argument(format!("path is not valid UTF-8: {}", path.display())))?
+        .as_bytes()
+        .to_vec();
+    CString::new(bytes).map_err(|_| Error::invalid_argument("path contains a NUL byte"))
 }
 
 /// Serializes `audiocpp_session_create` across every model and registry.
@@ -56,29 +73,10 @@ pub(crate) fn allocation_failed(what: &str) -> Error {
 /// construction is serialized.
 static SESSION_CREATION: Mutex<()> = Mutex::new(());
 
-fn options_ptr(options: Option<&Options>) -> *const sys::audiocpp_options {
-    options.map_or(ptr::null(), |o| o.as_ptr())
-}
-
-pub(crate) fn path_c_string(path: &Path) -> Result<CString> {
-    #[cfg(unix)]
-    let bytes = {
-        use std::os::unix::ffi::OsStrExt;
-        path.as_os_str().as_bytes().to_vec()
-    };
-    #[cfg(not(unix))]
-    let bytes = path
-        .to_str()
-        .ok_or_else(|| Error::invalid_argument(format!("path is not valid UTF-8: {}", path.display())))?
-        .as_bytes()
-        .to_vec();
-    CString::new(bytes).map_err(|_| Error::invalid_argument("path contains a NUL byte"))
-}
-
 handle!(
     /// The set of model loaders compiled into the library. Entry point for
     /// loading models.
-    Registry,
+    pub Registry,
     sys::audiocpp_registry,
     sys::audiocpp_registry_free
 );
@@ -98,8 +96,8 @@ impl Registry {
         let version = abi_version();
         if !version.is_compatible() {
             return Err(Error::new(
-                ErrorKind::NotAvailable,
-                format!("libaudiocpp ABI {version} is incompatible with bindings built for {}", AbiVersion::BINDINGS),
+                ErrorKind::IncompatibleAbi,
+                format!("libaudiocpp ABI {version} cannot serve bindings built for {}", AbiVersion::BINDINGS),
             ));
         }
         let config_path = config_path.map(path_c_string).transpose()?;
@@ -146,7 +144,7 @@ impl Registry {
 
 /// Model selection. Every field is optional and maps onto the CLI flag of the
 /// same name.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct ModelConfig {
     /// `--family`; `None` identifies the model from its path.
     pub family: Option<String>,
@@ -163,99 +161,20 @@ impl ModelConfig {
     pub fn family(family: impl Into<String>) -> Self {
         Self { family: Some(family.into()), ..Self::default() }
     }
-}
 
-/// Offline (whole request at once) or streaming (pushed chunks) execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum Mode {
-    #[default]
-    Offline,
-    Streaming,
-}
-
-impl Mode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Mode::Offline => "offline",
-            Mode::Streaming => "streaming",
-        }
-    }
-
-    pub(crate) fn as_c_str(self) -> &'static std::ffi::CStr {
-        match self {
-            Mode::Offline => c"offline",
-            Mode::Streaming => c"streaming",
-        }
-    }
-}
-
-/// Compute backend for a session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum Backend {
-    #[default]
-    Cpu,
-    Cuda,
-    Hip,
-    Vulkan,
-    Metal,
-    /// Let audio.cpp pick the best available backend.
-    Best,
-}
-
-impl Backend {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Backend::Cpu => "cpu",
-            Backend::Cuda => "cuda",
-            Backend::Hip => "hip",
-            Backend::Vulkan => "vulkan",
-            Backend::Metal => "metal",
-            Backend::Best => "best",
-        }
-    }
-
-    fn as_c_str(self) -> &'static std::ffi::CStr {
-        match self {
-            Backend::Cpu => c"cpu",
-            Backend::Cuda => c"cuda",
-            Backend::Hip => c"hip",
-            Backend::Vulkan => c"vulkan",
-            Backend::Metal => c"metal",
-            Backend::Best => c"best",
-        }
-    }
-}
-
-/// Backend, device index and thread count for a session (`--backend`,
-/// `--device`, `--threads`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct BackendConfig {
-    pub backend: Backend,
-    pub device: i32,
-    pub threads: i32,
-}
-
-impl BackendConfig {
-    /// `backend` on device 0, with one thread per available CPU.
-    pub fn new(backend: Backend) -> Self {
-        let threads = std::thread::available_parallelism().map_or(1, |n| n.get() as i32);
-        Self { backend, device: 0, threads }
-    }
-
-    pub fn device(mut self, device: i32) -> Self {
-        self.device = device;
+    pub fn config_id(mut self, id: impl Into<String>) -> Self {
+        self.config_id = Some(id.into());
         self
     }
 
-    pub fn threads(mut self, threads: i32) -> Self {
-        self.threads = threads;
+    pub fn weight_id(mut self, id: impl Into<String>) -> Self {
+        self.weight_id = Some(id.into());
         self
     }
-}
 
-impl Default for BackendConfig {
-    fn default() -> Self {
-        Self::new(Backend::Cpu)
+    pub fn model_spec_override(mut self, spec: impl Into<String>) -> Self {
+        self.model_spec_override = Some(spec.into());
+        self
     }
 }
 
@@ -281,7 +200,7 @@ impl OptionScope {
 }
 
 /// An option a model declares. Absent strings are empty. Bounds are
-/// discovery metadata only; they are not enforced.
+/// discovery metadata for building UIs; the library does not enforce them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OptionInfo {
     pub name: String,
@@ -293,9 +212,30 @@ pub struct OptionInfo {
     pub required: bool,
 }
 
+/// Everything a UI needs to describe a loaded model, gathered in one call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelInfo {
+    pub family: String,
+    pub description: String,
+    /// Tasks the model serves offline.
+    pub offline_tasks: Vec<Task>,
+    /// Tasks the model serves in streaming mode.
+    pub streaming_tasks: Vec<Task>,
+    pub languages: Vec<String>,
+    pub timestamps: bool,
+    pub speaker_reference: bool,
+    pub style_condition: bool,
+    pub load_options: Vec<OptionInfo>,
+    pub session_options: Vec<OptionInfo>,
+    pub request_options: Vec<OptionInfo>,
+}
+
 handle!(
-    /// A loaded model. Create [`Session`]s from it to run tasks.
-    Model,
+    /// A loaded model. Cheap: it holds the parsed config and a mapping of the
+    /// weight files. Each [`OfflineSession`] / [`StreamingSession`] created
+    /// from it uploads its own copy of the weights to the compute device, so
+    /// reuse sessions rather than creating one per request.
+    pub Model,
     sys::audiocpp_model,
     sys::audiocpp_model_free
 );
@@ -311,10 +251,9 @@ impl Model {
         unsafe { owned_string(sys::audiocpp_model_description(self.as_ptr())) }
     }
 
-    /// Whether the model serves `task` (one of [`crate::tasks`]) in `mode`.
-    /// An unrecognised task reads as `false`.
-    pub fn supports(&self, task: &str, mode: Mode) -> bool {
-        let Ok(task) = CString::new(task) else { return false };
+    /// Whether the model serves `task` in `mode`.
+    pub fn supports(&self, task: &Task, mode: Mode) -> bool {
+        let Ok(task) = task.c_string() else { return false };
         // SAFETY: valid handle and C strings.
         unsafe { sys::audiocpp_model_supports(self.as_ptr(), task.as_ptr(), mode.as_c_str().as_ptr()) != 0 }
     }
@@ -384,24 +323,34 @@ impl Model {
             .collect()
     }
 
-    /// Creates a session for `task` (one of [`crate::tasks`], e.g. `"tts"`,
-    /// `"asr"`, `"vad"`). `options` corresponds to `--session-option`.
-    pub fn create_session(
+    /// Family, capabilities, languages and declared options in one value.
+    pub fn info(&self) -> Result<ModelInfo> {
+        let tasks = Task::all();
+        let serving = |mode| tasks.iter().filter(|t| self.supports(t, mode)).cloned().collect();
+        Ok(ModelInfo {
+            family: self.family(),
+            description: self.description(),
+            offline_tasks: serving(Mode::Offline),
+            streaming_tasks: serving(Mode::Streaming),
+            languages: self.languages()?,
+            timestamps: self.supports_timestamps(),
+            speaker_reference: self.supports_speaker_reference(),
+            style_condition: self.supports_style_condition(),
+            load_options: self.options(OptionScope::Load)?,
+            session_options: self.options(OptionScope::Session)?,
+            request_options: self.options(OptionScope::Request)?,
+        })
+    }
+
+    pub(crate) fn create_session(
         &self,
-        task: &str,
+        task: &Task,
         mode: Mode,
         backend: &BackendConfig,
         options: Option<&Options>,
-    ) -> Result<Session> {
-        if backend.device < 0 || backend.threads <= 0 {
-            return Err(Error::invalid_argument("device must be non-negative and threads positive"));
-        }
-        let task = c_string(task, "task")?;
-        let raw = sys::audiocpp_backend_config {
-            backend: backend.backend.as_c_str().as_ptr(),
-            device: backend.device,
-            threads: backend.threads,
-        };
+    ) -> Result<NonNull<sys::audiocpp_session>> {
+        let task = task.c_string()?;
+        let raw = backend.raw()?;
         create(
             |out| {
                 // The lock guards native state, not Rust data, and the C ABI
@@ -421,14 +370,39 @@ impl Model {
                     )
                 }
             },
-            |p| unsafe { Session::from_raw(p) },
+            |p| p,
         )
+    }
+
+    /// Creates an offline session for `task`. `options` corresponds to
+    /// `--session-option`.
+    pub fn offline_session(
+        &self,
+        task: impl Into<Task>,
+        backend: &BackendConfig,
+        options: Option<&Options>,
+    ) -> Result<OfflineSession> {
+        let ptr = self.create_session(&task.into(), Mode::Offline, backend, options)?;
+        // SAFETY: a fresh session handle whose ownership we take.
+        Ok(unsafe { OfflineSession::from_raw(ptr) })
+    }
+
+    /// Creates a streaming session for `task`.
+    pub fn streaming_session(
+        &self,
+        task: impl Into<Task>,
+        backend: &BackendConfig,
+        options: Option<&Options>,
+    ) -> Result<StreamingSession> {
+        let ptr = self.create_session(&task.into(), Mode::Streaming, backend, options)?;
+        // SAFETY: as above.
+        Ok(unsafe { StreamingSession::from_raw(ptr) })
     }
 }
 
 impl std::fmt::Debug for Options {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Options").field("ptr", &self.ptr).finish()
+        f.debug_struct("Options").finish_non_exhaustive()
     }
 }
 

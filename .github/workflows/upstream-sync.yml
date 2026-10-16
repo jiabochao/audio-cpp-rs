@@ -1,0 +1,53 @@
+name: Sync upstream
+
+# Daily: if audio.cpp's main branch moved, regenerate the bindings and the
+# model catalog against it, run the full CI on the result, and open a pull
+# request. A change of the ABI major version stops here for a human.
+
+on:
+  schedule:
+    - cron: "17 0 * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Upstream branch or commit
+        default: main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.update.outputs.changed }}
+      commit: ${{ steps.update.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install bindgen
+        run: |
+          sudo apt-get update && sudo apt-get install -y libclang-dev
+          cargo install bindgen-cli --locked
+      - id: update
+        run: |
+          before=$(git rev-parse HEAD:audio-cpp-sys/build.rs)
+          scripts/update-upstream.sh "${{ inputs.ref || 'main' }}"
+          commit=$(sed -n 's/^const SOURCE_COMMIT: &str = "\([0-9a-f]\{40\}\)";$/\1/p' audio-cpp-sys/build.rs)
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          if git diff --quiet; then echo "changed=false" >> "$GITHUB_OUTPUT"; else echo "changed=true" >> "$GITHUB_OUTPUT"; fi
+      - if: steps.update.outputs.changed == 'true'
+        run: cargo fmt --all
+      - if: steps.update.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: upstream-sync
+          commit-message: "Sync audio.cpp to ${{ steps.update.outputs.commit }}"
+          title: "Sync audio.cpp to ${{ steps.update.outputs.commit }}"
+          body: |
+            Automated update to https://github.com/0xShug0/audio.cpp/commit/${{ steps.update.outputs.commit }}.
+
+            Regenerated `audio-cpp-sys/include/audiocpp.h`, `audio-cpp-sys/src/bindings.rs` and
+            `src/catalog/model_specs.json`. CI runs on this pull request; merge once it is green.
+          delete-branch: true

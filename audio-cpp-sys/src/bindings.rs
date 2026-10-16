@@ -98,9 +98,7 @@ unsafe extern "C" {
     pub fn audiocpp_task_name(index: usize) -> *const ::core::ffi::c_char;
 }
 unsafe extern "C" {
-    pub fn audiocpp_task_from_spec_name(
-        spec_task: *const ::core::ffi::c_char,
-    ) -> *const ::core::ffi::c_char;
+    pub fn audiocpp_task_from_spec_name(spec_task: *const ::core::ffi::c_char) -> *const ::core::ffi::c_char;
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -110,6 +108,19 @@ pub struct audiocpp_model_config {
     pub weight_id: *const ::core::ffi::c_char,
     pub model_spec_override: *const ::core::ffi::c_char,
 }
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of audiocpp_model_config"][::core::mem::size_of::<audiocpp_model_config>() - 32usize];
+    ["Alignment of audiocpp_model_config"][::core::mem::align_of::<audiocpp_model_config>() - 8usize];
+    ["Offset of field: audiocpp_model_config::family_hint"]
+        [::core::mem::offset_of!(audiocpp_model_config, family_hint) - 0usize];
+    ["Offset of field: audiocpp_model_config::config_id"]
+        [::core::mem::offset_of!(audiocpp_model_config, config_id) - 8usize];
+    ["Offset of field: audiocpp_model_config::weight_id"]
+        [::core::mem::offset_of!(audiocpp_model_config, weight_id) - 16usize];
+    ["Offset of field: audiocpp_model_config::model_spec_override"]
+        [::core::mem::offset_of!(audiocpp_model_config, model_spec_override) - 24usize];
+};
 unsafe extern "C" {
     pub fn audiocpp_model_load(
         registry: *mut audiocpp_registry,
@@ -139,14 +150,10 @@ unsafe extern "C" {
     pub fn audiocpp_model_supports_timestamps(model: *const audiocpp_model) -> ::core::ffi::c_int;
 }
 unsafe extern "C" {
-    pub fn audiocpp_model_supports_speaker_reference(
-        model: *const audiocpp_model,
-    ) -> ::core::ffi::c_int;
+    pub fn audiocpp_model_supports_speaker_reference(model: *const audiocpp_model) -> ::core::ffi::c_int;
 }
 unsafe extern "C" {
-    pub fn audiocpp_model_supports_style_condition(
-        model: *const audiocpp_model,
-    ) -> ::core::ffi::c_int;
+    pub fn audiocpp_model_supports_style_condition(model: *const audiocpp_model) -> ::core::ffi::c_int;
 }
 unsafe extern "C" {
     pub fn audiocpp_model_language_count(model: *const audiocpp_model) -> usize;
@@ -163,10 +170,7 @@ pub const AUDIOCPP_OPTION_SCOPE_SESSION: audiocpp_option_scope = 1;
 pub const AUDIOCPP_OPTION_SCOPE_LOAD: audiocpp_option_scope = 2;
 pub type audiocpp_option_scope = ::core::ffi::c_uint;
 unsafe extern "C" {
-    pub fn audiocpp_model_option_count(
-        model: *const audiocpp_model,
-        scope: audiocpp_option_scope,
-    ) -> usize;
+    pub fn audiocpp_model_option_count(model: *const audiocpp_model, scope: audiocpp_option_scope) -> usize;
 }
 unsafe extern "C" {
     pub fn audiocpp_model_option(
@@ -189,6 +193,17 @@ pub struct audiocpp_backend_config {
     pub device: ::core::ffi::c_int,
     pub threads: ::core::ffi::c_int,
 }
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of audiocpp_backend_config"][::core::mem::size_of::<audiocpp_backend_config>() - 16usize];
+    ["Alignment of audiocpp_backend_config"][::core::mem::align_of::<audiocpp_backend_config>() - 8usize];
+    ["Offset of field: audiocpp_backend_config::backend"]
+        [::core::mem::offset_of!(audiocpp_backend_config, backend) - 0usize];
+    ["Offset of field: audiocpp_backend_config::device"]
+        [::core::mem::offset_of!(audiocpp_backend_config, device) - 8usize];
+    ["Offset of field: audiocpp_backend_config::threads"]
+        [::core::mem::offset_of!(audiocpp_backend_config, threads) - 12usize];
+};
 unsafe extern "C" {
     pub fn audiocpp_session_create(
         model: *const audiocpp_model,
@@ -274,22 +289,13 @@ unsafe extern "C" {
     ) -> audiocpp_status;
 }
 unsafe extern "C" {
-    pub fn audiocpp_request_set_speaking_rate(
-        request: *mut audiocpp_request,
-        speaking_rate: f32,
-    ) -> audiocpp_status;
+    pub fn audiocpp_request_set_speaking_rate(request: *mut audiocpp_request, speaking_rate: f32) -> audiocpp_status;
 }
 unsafe extern "C" {
-    pub fn audiocpp_request_set_pitch_shift(
-        request: *mut audiocpp_request,
-        pitch_shift: f32,
-    ) -> audiocpp_status;
+    pub fn audiocpp_request_set_pitch_shift(request: *mut audiocpp_request, pitch_shift: f32) -> audiocpp_status;
 }
 unsafe extern "C" {
-    pub fn audiocpp_request_set_energy_scale(
-        request: *mut audiocpp_request,
-        energy_scale: f32,
-    ) -> audiocpp_status;
+    pub fn audiocpp_request_set_energy_scale(request: *mut audiocpp_request, energy_scale: f32) -> audiocpp_status;
 }
 unsafe extern "C" {
     pub fn audiocpp_request_set_style_tag(
@@ -428,10 +434,7 @@ unsafe extern "C" {
     ) -> audiocpp_status;
 }
 unsafe extern "C" {
-    pub fn audiocpp_result_artifact_meta_count(
-        result: *const audiocpp_result,
-        index: usize,
-    ) -> usize;
+    pub fn audiocpp_result_artifact_meta_count(result: *const audiocpp_result, index: usize) -> usize;
 }
 unsafe extern "C" {
     pub fn audiocpp_result_artifact_meta(
@@ -458,10 +461,7 @@ unsafe extern "C" {
     ) -> audiocpp_status;
 }
 unsafe extern "C" {
-    pub fn audiocpp_stream_start(
-        session: *mut audiocpp_session,
-        request: *const audiocpp_request,
-    ) -> audiocpp_status;
+    pub fn audiocpp_stream_start(session: *mut audiocpp_session, request: *const audiocpp_request) -> audiocpp_status;
 }
 unsafe extern "C" {
     pub fn audiocpp_stream_push(

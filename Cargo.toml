@@ -21,12 +21,21 @@ categories = ["api-bindings", "multimedia::audio"]
 
 [dependencies]
 audio-cpp-sys = { path = "audio-cpp-sys", version = "0.1.0", default-features = false }
+hound = { version = "3.5", optional = true }
+rubato = { version = "0.16", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+symphonia = { version = "0.5", optional = true, default-features = false, features = ["aac", "adpcm", "aiff", "alac", "caf", "flac", "isomp4", "mp3", "ogg", "pcm", "vorbis", "wav"] }
 
 [dev-dependencies]
 hound = "3.5"
 
 [features]
-default = ["openmp"]
+default = ["openmp", "catalog", "wav"]
+catalog = ["dep:serde", "dep:serde_json"]
+wav = ["dep:hound"]
+resample = ["dep:rubato"]
+decode = ["dep:symphonia"]
 openmp = ["audio-cpp-sys/openmp"]
 native = ["audio-cpp-sys/native"]
 cuda = ["audio-cpp-sys/cuda"]

@@ -3,18 +3,31 @@ use std::fmt;
 
 use audio_cpp_sys as sys;
 
-/// Non-OK status codes returned by the C ABI.
+/// What went wrong. The first group mirrors the C ABI's status codes; the
+/// rest are raised by this crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ErrorKind {
+    /// A bad argument, rejected either by this crate before the call or by
+    /// the library.
     InvalidArgument,
+    /// The registry has no loader for the requested family.
     UnsupportedFamily,
+    /// The model files could not be loaded.
     LoadFailed,
+    /// Inference or session setup failed inside the library.
     Runtime,
     OutOfMemory,
     OutOfRange,
+    /// The requested output or feature does not exist.
     NotAvailable,
-    /// A status this version of the bindings does not know about.
+    /// The loaded `libaudiocpp` cannot serve these bindings.
+    IncompatibleAbi,
+    /// The caller cancelled the operation through a [`crate::CancelToken`].
+    Cancelled,
+    /// Waiting for a pooled session timed out.
+    Timeout,
+    /// A status code this version of the bindings does not know about.
     Other(u32),
 }
 
@@ -41,13 +54,15 @@ impl ErrorKind {
             Self::OutOfMemory => "out of memory",
             Self::OutOfRange => "out of range",
             Self::NotAvailable => "not available",
+            Self::IncompatibleAbi => "incompatible library ABI",
+            Self::Cancelled => "cancelled",
+            Self::Timeout => "timed out",
             Self::Other(_) => "unknown status",
         }
     }
 }
 
-/// An error from audio.cpp: the status code plus the detail message the
-/// library recorded for the failing call.
+/// An error from audio.cpp or from this crate: a kind plus a detail message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error {
     kind: ErrorKind,
@@ -67,7 +82,8 @@ impl Error {
         self.kind
     }
 
-    /// The library's detail message (`audiocpp_last_error()`), possibly empty.
+    /// The detail message: the library's `audiocpp_last_error()` for native
+    /// failures, possibly empty.
     pub fn message(&self) -> &str {
         &self.message
     }

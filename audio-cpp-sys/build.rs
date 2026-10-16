@@ -1,38 +1,58 @@
-//! Provides `libaudiocpp`, the audio.cpp C ABI shared library, in this order:
+//! Provides `libaudiocpp`, the audio.cpp C ABI shared library.
+//!
+//! Resolution order:
 //!
 //! 1. `AUDIOCPP_LIB_DIR` set: link the library in that directory, e.g. the
 //!    `libs/` directory of an unpacked `audio-<tag>-lib-*` release archive.
-//! 2. Download the prebuilt release archive matching the target and the
-//!    enabled backend feature, verified against GitHub's sha256 digest and
-//!    checked for ABI compatibility with `include/audiocpp.h`.
-//! 3. Otherwise build from source with CMake: `AUDIOCPP_SRC_DIR` if set, else
-//!    the pinned upstream commit [`SOURCE_COMMIT`], downloaded as a tarball.
+//! 2. A prebuilt release archive matching the target and the backend feature,
+//!    verified against GitHub's sha256 digest and the ABI of its header.
+//! 3. A CMake build of the pinned upstream commit [`SOURCE_COMMIT`] (or of
+//!    `AUDIOCPP_SRC_DIR`).
+//!
+//! Downloads and native builds live in a persistent cache keyed by everything
+//! that affects them, so `cargo clean`, other profiles and other checkouts
+//! reuse them: a full source build takes the better part of an hour. The
+//! libraries are then copied into `OUT_DIR/lib`, which is where `cargo run`
+//! and `cargo test` look for them at run time.
 //!
 //! Environment:
 //!
 //! | variable | |
 //! |---|---|
 //! | `AUDIOCPP_BUILD` | `auto` (default: 2 then 3), `prebuilt` (2 only), `source` (3 only) |
-//! | `AUDIOCPP_RELEASE` | release tag to download; default the latest release |
-//! | `AUDIOCPP_CUDA_VERSION` | CUDA flavour of the prebuilt archive, e.g. `12.8`; default the lowest offered |
+//! | `AUDIOCPP_LIB_DIR` | link an existing library, skipping everything else |
+//! | `AUDIOCPP_CACHE_DIR` | cache location; `off` keeps everything in `OUT_DIR` |
+//! | `AUDIOCPP_OFFLINE` | `1` forbids network access (also `CARGO_NET_OFFLINE=true`) |
+//! | `AUDIOCPP_RELEASE` | release tag to download, or `latest`; default [`PREBUILT_RELEASE`] |
+//! | `AUDIOCPP_CUDA_VERSION` | CUDA flavour of the archive, e.g. `12.8`; default the oldest |
 //! | `AUDIOCPP_PORTABLE` | `1` selects the `-portable` (no AVX2) CPU/Vulkan archive |
-//! | `AUDIOCPP_SRC_DIR` | local audio.cpp checkout for source builds |
+//! | `AUDIOCPP_GITHUB_API` | GitHub API base URL, for mirrors |
+//! | `GITHUB_TOKEN` | raises the GitHub API rate limit |
+//! | `AUDIOCPP_SRC_DIR` | build from a local audio.cpp tree (not cached) |
 //! | `AUDIOCPP_MODEL_SET`, `AUDIOCPP_MODELS`, `AUDIOCPP_CMAKE_ARGS` | source build knobs; setting any implies a source build |
-//! | `GITHUB_TOKEN` | optional, raises the GitHub API rate limit |
-//! | `AUDIOCPP_GITHUB_API` | GitHub API base URL, default `https://api.github.com` (for mirrors) |
 //!
-//! The library is always linked dynamically. Its directory is exported to
-//! dependent build scripts as `DEP_AUDIOCPP_LIB_DIR`.
+//! Dependent build scripts get `DEP_AUDIOCPP_LIB_DIR` (the libraries to ship
+//! next to an executable) and `DEP_AUDIOCPP_INCLUDE`.
 
 use std::env;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
+
+#[path = "build/archive.rs"]
+mod archive;
+
 const UPSTREAM: &str = "0xShug0/audio.cpp";
 /// Upstream commit the bindings were generated from; used for source builds.
-const SOURCE_COMMIT: &str = "6796068942c4ae6f55299371983b3d05ef8389ee";
+const SOURCE_COMMIT: &str = "0097d365a00b52a6991ad7618f0a04e8d2935e47";
+/// Release whose prebuilt archives match [`SOURCE_COMMIT`]. `AUDIOCPP_RELEASE`
+/// overrides it; `latest` follows upstream's newest release instead.
+const PREBUILT_RELEASE: &str = "v0.9.2";
+/// Bumped when the layout of cached builds changes.
+const CACHE_LAYOUT: u32 = 1;
 
 type BoxError = Box<dyn std::error::Error>;
 
@@ -40,20 +60,33 @@ fn main() {
     for var in [
         "AUDIOCPP_LIB_DIR",
         "AUDIOCPP_BUILD",
+        "AUDIOCPP_CACHE_DIR",
+        "AUDIOCPP_OFFLINE",
         "AUDIOCPP_RELEASE",
         "AUDIOCPP_CUDA_VERSION",
         "AUDIOCPP_PORTABLE",
+        "AUDIOCPP_GITHUB_API",
         "AUDIOCPP_SRC_DIR",
         "AUDIOCPP_MODEL_SET",
         "AUDIOCPP_MODELS",
         "AUDIOCPP_CMAKE_ARGS",
-        "AUDIOCPP_GITHUB_API",
+        "CARGO_NET_OFFLINE",
+        "CMAKE_GENERATOR",
+        "CMAKE_TOOLCHAIN_FILE",
+        "CC",
+        "CXX",
+        "CFLAGS",
+        "CXXFLAGS",
+        "VULKAN_SDK",
+        "CUDA_PATH",
         "DOCS_RS",
     ] {
         println!("cargo:rerun-if-env-changed={var}");
     }
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=include/audiocpp.h");
+    println!("cargo:rerun-if-changed=cmake/short-paths.cmake");
+    println!("cargo:include={}", manifest_dir().join("include").display());
 
     // docs.rs has neither network nor time to build audio.cpp, and
     // documentation needs only the declarations.
@@ -62,8 +95,18 @@ fn main() {
     }
 
     let lib_dir = match env::var_os("AUDIOCPP_LIB_DIR") {
-        Some(dir) => PathBuf::from(dir),
-        None => locate_or_build(),
+        Some(dir) => {
+            let dir = PathBuf::from(dir);
+            if !has_library(&dir) {
+                panic!("AUDIOCPP_LIB_DIR={} contains no libaudiocpp", dir.display());
+            }
+            println!("cargo:rerun-if-changed={}", dir.display());
+            dir
+        }
+        None => {
+            let found = locate_or_build();
+            stage_runtime(&found).unwrap_or_else(|e| panic!("cannot stage libaudiocpp into OUT_DIR: {e}"))
+        }
     };
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
@@ -73,8 +116,9 @@ fn main() {
 
 fn locate_or_build() -> PathBuf {
     let mode = env::var("AUDIOCPP_BUILD").unwrap_or_else(|_| "auto".into());
-    let wants_source_knobs =
-        ["AUDIOCPP_MODEL_SET", "AUDIOCPP_MODELS", "AUDIOCPP_CMAKE_ARGS"].iter().any(|v| env::var_os(v).is_some());
+    let wants_source_knobs = ["AUDIOCPP_MODEL_SET", "AUDIOCPP_MODELS", "AUDIOCPP_CMAKE_ARGS", "AUDIOCPP_SRC_DIR"]
+        .iter()
+        .any(|v| env::var_os(v).is_some());
     match mode.as_str() {
         "source" => build_from_source(),
         "prebuilt" => download_prebuilt().unwrap_or_else(|e| panic!("prebuilt libaudiocpp unavailable: {e}")),
@@ -90,6 +134,10 @@ fn locate_or_build() -> PathBuf {
     }
 }
 
+fn manifest_dir() -> PathBuf {
+    PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
+}
+
 fn out_dir() -> PathBuf {
     PathBuf::from(env::var("OUT_DIR").unwrap())
 }
@@ -98,8 +146,206 @@ fn feature(name: &str) -> bool {
     env::var_os(format!("CARGO_FEATURE_{}", name.to_uppercase())).is_some()
 }
 
+fn truthy(var: &str) -> bool {
+    env::var(var).is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+}
+
+/// `cargo --offline` is not reliably visible to build scripts, hence the
+/// crate's own switch alongside Cargo's.
 fn offline() -> bool {
-    env::var("CARGO_NET_OFFLINE").is_ok_and(|v| v == "true")
+    truthy("AUDIOCPP_OFFLINE") || truthy("CARGO_NET_OFFLINE")
+}
+
+// ---------------------------------------------------------------------------
+// Persistent cache
+// ---------------------------------------------------------------------------
+
+/// The cache root, or `None` to keep everything inside `OUT_DIR`.
+fn cache_root() -> Option<PathBuf> {
+    if let Some(dir) = env::var_os("AUDIOCPP_CACHE_DIR") {
+        let off = dir.is_empty() || dir.to_str().is_some_and(|d| d.eq_ignore_ascii_case("off"));
+        return (!off).then(|| PathBuf::from(dir));
+    }
+    // The build script runs on the host, so these are the host's conventions.
+    let base = if cfg!(windows) {
+        env::var_os("LOCALAPPDATA").map(PathBuf::from)
+    } else if cfg!(target_os = "macos") {
+        env::var_os("HOME").map(|home| PathBuf::from(home).join("Library/Caches"))
+    } else {
+        env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+    };
+    base.map(|base| base.join("audio-cpp-rs"))
+}
+
+fn cache_dir(kind: &str) -> PathBuf {
+    let dir = cache_root().unwrap_or_else(|| out_dir().join("cache")).join(kind);
+    fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("cannot create {}: {e}", dir.display()));
+    dir
+}
+
+/// Holds an exclusive lock on `<dir>.lock` while alive, so concurrent builds
+/// (two checkouts, `cargo build` beside rust-analyzer) do not write the same
+/// cache entry at once.
+struct CacheLock(fs::File);
+
+impl CacheLock {
+    fn acquire(dir: &Path) -> io::Result<Self> {
+        // Appended rather than `with_extension`: entry names contain dots
+        // (`audio.cpp-<commit>`, `audio-v0.9.2-lib-…`).
+        let mut name = dir.file_name().unwrap_or_default().to_os_string();
+        name.push(".lock");
+        let path = dir.with_file_name(name);
+        let file = fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path)?;
+        if fs4::fs_std::FileExt::try_lock_exclusive(&file).is_err() {
+            println!("cargo:warning=waiting for another build to finish {}", dir.display());
+            fs4::fs_std::FileExt::lock_exclusive(&file)?;
+        }
+        Ok(Self(file))
+    }
+}
+
+impl Drop for CacheLock {
+    fn drop(&mut self) {
+        let _ = fs4::fs_std::FileExt::unlock(&self.0);
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Copies the shared libraries in `from` into `OUT_DIR/lib`, the directory
+/// Cargo adds to the loader path for `cargo run` / `cargo test`, and returns it.
+/// Unix symlinks (libaudiocpp.so -> .so.0 -> .so.0.1.0) are recreated.
+fn stage_runtime(from: &Path) -> io::Result<PathBuf> {
+    let to = out_dir().join("lib");
+    if to.exists() {
+        fs::remove_dir_all(&to)?;
+    }
+    fs::create_dir_all(&to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(text) = name.to_str() else { continue };
+        let is_library =
+            [".so", ".dylib", ".dll", ".lib", ".dll.a"].iter().any(|ext| text.ends_with(ext)) || text.contains(".so.");
+        if !is_library {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        let target = to.join(&name);
+        #[cfg(unix)]
+        if file_type.is_symlink() {
+            std::os::unix::fs::symlink(fs::read_link(entry.path())?, &target)?;
+            continue;
+        }
+        if file_type.is_file() || file_type.is_symlink() {
+            // A hard link is instant and costs no space; fall back to copying
+            // across file systems.
+            if fs::hard_link(entry.path(), &target).is_err() {
+                fs::copy(entry.path(), &target)?;
+            }
+        }
+    }
+    if !has_library(&to) {
+        return Err(io::Error::other(format!("no libaudiocpp in {}", from.display())));
+    }
+    Ok(to)
+}
+
+fn has_library(dir: &Path) -> bool {
+    ["libaudiocpp.so", "libaudiocpp.dylib", "audiocpp.lib", "libaudiocpp.dll.a"]
+        .iter()
+        .any(|name| dir.join(name).exists())
+}
+
+// ---------------------------------------------------------------------------
+// HTTP
+// ---------------------------------------------------------------------------
+
+fn agent() -> ureq::Agent {
+    ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(60 * 60))).build().into()
+}
+
+fn github_api() -> String {
+    env::var("AUDIOCPP_GITHUB_API").unwrap_or_else(|_| "https://api.github.com".into()).trim_end_matches('/').into()
+}
+
+fn get(url: &str) -> Result<ureq::http::Response<ureq::Body>, BoxError> {
+    let mut request = agent().get(url).header("User-Agent", "audio-cpp-sys-build");
+    if url.starts_with(&github_api()) {
+        request = request.header("Accept", "application/vnd.github+json");
+        if let Ok(token) = env::var("GITHUB_TOKEN") {
+            request = request.header("Authorization", &format!("Bearer {token}"));
+        }
+    }
+    Ok(request.call()?)
+}
+
+/// Streams `url` into `path`, returning the body's sha256. Writes to a
+/// `.part` file first so an interrupted download is never mistaken for a
+/// complete one.
+fn download(url: &str, path: &Path) -> Result<String, BoxError> {
+    let partial = path.with_extension("part");
+    let mut response = get(url)?;
+    let mut reader = response.body_mut().as_reader();
+    let mut file = io::BufWriter::new(fs::File::create(&partial)?);
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+        let n = reader.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+        file.write_all(&buffer[..n])?;
+    }
+    file.flush()?;
+    drop(file);
+    fs::rename(&partial, path)?;
+    Ok(hex(&hasher.finalize()))
+}
+
+fn unpack(archive: &Path, dest: &Path) -> Result<(), BoxError> {
+    if archive.extension().is_some_and(|e| e == "zip") {
+        archive::unzip(&fs::read(archive)?, dest)
+    } else {
+        tar::Archive::new(flate2::read::GzDecoder::new(fs::File::open(archive)?)).unpack(dest)?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ABI
+// ---------------------------------------------------------------------------
+
+fn bindings_header() -> PathBuf {
+    manifest_dir().join("include/audiocpp.h")
+}
+
+fn abi_version(header: &Path) -> Result<(u32, u32), BoxError> {
+    let text = fs::read_to_string(header).map_err(|e| format!("{}: {e}", header.display()))?;
+    let define = |key: &str| -> Result<u32, BoxError> {
+        text.lines()
+            .find_map(|line| line.trim().strip_prefix("#define ")?.trim().strip_prefix(key)?.trim().parse().ok())
+            .ok_or_else(|| format!("{} defines no {key}", header.display()).into())
+    };
+    Ok((define("AUDIOCPP_ABI_VERSION_MAJOR")?, define("AUDIOCPP_ABI_VERSION_MINOR")?))
+}
+
+/// The library must have the same major ABI and at least the minor the
+/// bindings declare, or symbols the bindings reference may be missing.
+fn check_abi(header: &Path) -> Result<(), BoxError> {
+    let ours = abi_version(&bindings_header())?;
+    let theirs = abi_version(header)?;
+    if theirs.0 != ours.0 || theirs.1 < ours.1 {
+        return Err(
+            format!("ABI {}.{} is incompatible with bindings for {}.{}", theirs.0, theirs.1, ours.0, ours.1).into()
+        );
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -107,9 +353,6 @@ fn offline() -> bool {
 // ---------------------------------------------------------------------------
 
 fn download_prebuilt() -> Result<PathBuf, BoxError> {
-    if offline() {
-        return Err("cargo is offline".into());
-    }
     let target_os = env::var("CARGO_CFG_TARGET_OS")?;
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH")?;
     let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
@@ -130,12 +373,24 @@ fn download_prebuilt() -> Result<PathBuf, BoxError> {
         (["vulkan"], false) => "vulkan",
         _ => return Err(format!("no prebuilt archive for features {gpu:?} on {platform}").into()),
     };
-    let portable = env::var("AUDIOCPP_PORTABLE").is_ok_and(|v| v == "1" || v == "true");
+    let portable = truthy("AUDIOCPP_PORTABLE");
+    let ext = if target_os == "windows" { "zip" } else { "tar.gz" };
+
+    // A pinned tag that is already cached needs no network at all.
+    let cache = cache_dir("prebuilt");
+    let wanted = release_tag();
+    if wanted != "latest" {
+        if let Some(dir) = cached_prebuilt(&cache, &wanted, platform, backend, portable) {
+            return Ok(dir);
+        }
+    }
+    if offline() {
+        return Err("offline, and no matching prebuilt archive is cached".into());
+    }
 
     let release = github_release()?;
     let tag = release["tag_name"].as_str().ok_or("release has no tag_name")?;
     let assets = release["assets"].as_array().ok_or("release has no assets")?;
-    let ext = if target_os == "windows" { "zip" } else { "tar.gz" };
     let asset_named = |name: &str| assets.iter().find(|a| a["name"].as_str() == Some(name));
 
     let (flavour, cudart) = if backend == "cuda" {
@@ -148,29 +403,50 @@ fn download_prebuilt() -> Result<PathBuf, BoxError> {
     };
     let name = format!("audio-{tag}-lib-{platform}-{flavour}.{ext}");
     let asset = asset_named(&name).ok_or_else(|| format!("release {tag} has no {name}"))?;
+    let digest = asset["digest"].as_str().and_then(|d| d.strip_prefix("sha256:")).map(str::to_ascii_lowercase);
 
-    let dest = out_dir().join("prebuilt").join(name.trim_end_matches(&format!(".{ext}")));
-    // The marker records what was unpacked, so a re-uploaded asset is fetched again.
-    let marker = dest.join(".complete");
-    let stamp = format!("{name} {}", asset["digest"].as_str().unwrap_or("-"));
-    if fs::read_to_string(&marker).ok().as_deref() != Some(stamp.as_str()) {
-        if dest.exists() {
-            fs::remove_dir_all(&dest)?;
+    // Keyed by digest, so a re-uploaded asset is a different entry.
+    let stem = name.trim_end_matches(&format!(".{ext}")).to_string();
+    let dir = cache.join(format!("{stem}-{}", digest.as_deref().map_or("unverified", |d| &d[..12])));
+    let marker = dir.join(".complete");
+    let _lock = CacheLock::acquire(&dir)?;
+    if !marker.exists() {
+        if dir.exists() {
+            fs::remove_dir_all(&dir)?;
         }
-        fs::create_dir_all(&dest)?;
-        fetch_asset(asset, &dest)?;
+        fs::create_dir_all(&dir)?;
+        fetch_asset(asset, digest.as_deref(), &dir)?;
         if let Some(cudart) = cudart {
             let asset = asset_named(&cudart).ok_or_else(|| format!("release {tag} has no {cudart}"))?;
-            fetch_asset(asset, &dest.join("libs"))?;
+            let digest = asset["digest"].as_str().and_then(|d| d.strip_prefix("sha256:")).map(str::to_ascii_lowercase);
+            fetch_asset(asset, digest.as_deref(), &dir.join("libs"))?;
         }
-        check_abi(&dest.join("include").join("audiocpp.h"))?;
-        fs::write(&marker, &stamp)?;
+        check_abi(&dir.join("include/audiocpp.h"))?;
+        if !has_library(&dir.join("libs")) {
+            return Err(format!("{name} contains no libaudiocpp under libs/").into());
+        }
+        fs::write(&marker, format!("{tag}\n{name}\n"))?;
     }
-    let libs = dest.join("libs");
-    if !has_library(&libs) {
-        return Err(format!("{name} contains no libaudiocpp under libs/").into());
-    }
-    Ok(libs)
+    Ok(dir.join("libs"))
+}
+
+fn cached_prebuilt(cache: &Path, tag: &str, platform: &str, backend: &str, portable: bool) -> Option<PathBuf> {
+    let flavour = if portable && backend != "metal" { format!("{backend}-portable") } else { backend.to_string() };
+    let prefix = if backend == "cuda" {
+        let version = env::var("AUDIOCPP_CUDA_VERSION").ok()?;
+        format!("audio-{tag}-lib-{platform}-cuda{version}-")
+    } else {
+        format!("audio-{tag}-lib-{platform}-{flavour}-")
+    };
+    fs::read_dir(cache)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(&prefix))
+                && p.join(".complete").exists()
+        })
+        .map(|p| p.join("libs"))
 }
 
 fn cuda_version(assets: &[serde_json::Value], tag: &str, platform: &str, ext: &str) -> Result<String, BoxError> {
@@ -194,117 +470,43 @@ fn cuda_version(assets: &[serde_json::Value], tag: &str, platform: &str, ext: &s
     Ok(offered.remove(0))
 }
 
-fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(30 * 60))).build().into()
-}
-
-fn github_api() -> String {
-    env::var("AUDIOCPP_GITHUB_API").unwrap_or_else(|_| "https://api.github.com".into()).trim_end_matches('/').into()
-}
-
-fn get(url: &str) -> Result<ureq::http::Response<ureq::Body>, BoxError> {
-    let mut request = agent().get(url).header("User-Agent", "audio-cpp-sys-build");
-    if url.starts_with(&github_api()) {
-        request = request.header("Accept", "application/vnd.github+json");
-        if let Ok(token) = env::var("GITHUB_TOKEN") {
-            request = request.header("Authorization", &format!("Bearer {token}"));
-        }
-    }
-    Ok(request.call()?)
+fn release_tag() -> String {
+    env::var("AUDIOCPP_RELEASE").ok().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| PREBUILT_RELEASE.into())
 }
 
 fn github_release() -> Result<serde_json::Value, BoxError> {
-    let url = match env::var("AUDIOCPP_RELEASE") {
-        Ok(tag) => format!("{}/repos/{UPSTREAM}/releases/tags/{tag}", github_api()),
-        Err(_) => format!("{}/repos/{UPSTREAM}/releases/latest", github_api()),
+    let url = match release_tag().as_str() {
+        "latest" => format!("{}/repos/{UPSTREAM}/releases/latest", github_api()),
+        tag => format!("{}/repos/{UPSTREAM}/releases/tags/{tag}", github_api()),
     };
     let body = get(&url)?.body_mut().read_to_string()?;
     Ok(serde_json::from_str(&body)?)
 }
 
-/// Downloads a release asset, verifies its sha256 digest when GitHub
-/// publishes one, and unpacks it into `dest`.
-fn fetch_asset(asset: &serde_json::Value, dest: &Path) -> Result<(), BoxError> {
-    use sha2::{Digest, Sha256};
-
+/// Downloads a release asset, verifies its sha256 when GitHub publishes one,
+/// and unpacks it into `dest`.
+fn fetch_asset(asset: &serde_json::Value, digest: Option<&str>, dest: &Path) -> Result<(), BoxError> {
     let name = asset["name"].as_str().ok_or("asset has no name")?;
     let url = asset["browser_download_url"].as_str().ok_or("asset has no download url")?;
-    let archive = out_dir().join(name);
-
-    let mut response = get(url)?;
-    let mut reader = response.body_mut().as_reader();
-    let mut file = fs::File::create(&archive)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0u8; 1 << 20];
-    loop {
-        let n = reader.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buffer[..n]);
-        io::Write::write_all(&mut file, &buffer[..n])?;
-    }
-    drop(file);
-
-    let actual: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
-    match asset["digest"].as_str().and_then(|d| d.strip_prefix("sha256:")) {
-        Some(expected) if expected.eq_ignore_ascii_case(&actual) => {}
+    fs::create_dir_all(dest)?;
+    let archive = dest.join(name);
+    let actual = download(url, &archive)?;
+    match digest {
+        Some(expected) if expected == actual => {}
         Some(expected) => {
             fs::remove_file(&archive).ok();
             return Err(format!("{name}: sha256 {actual} does not match published {expected}").into());
         }
         None => println!("cargo:warning={name}: release publishes no digest; not verified"),
     }
-
-    fs::create_dir_all(dest)?;
-    let file = fs::File::open(&archive)?;
-    if name.ends_with(".zip") {
-        zip::ZipArchive::new(file)?.extract(dest)?;
-    } else {
-        tar::Archive::new(flate2::read::GzDecoder::new(file)).unpack(dest)?;
-    }
+    unpack(&archive, dest)?;
     fs::remove_file(&archive).ok();
     Ok(())
-}
-
-fn abi_version(header: &Path) -> Result<(u32, u32), BoxError> {
-    let text = fs::read_to_string(header).map_err(|e| format!("{}: {e}", header.display()))?;
-    let define = |key: &str| -> Result<u32, BoxError> {
-        text.lines()
-            .find_map(|line| line.trim().strip_prefix("#define ")?.trim().strip_prefix(key)?.trim().parse().ok())
-            .ok_or_else(|| format!("{} defines no {key}", header.display()).into())
-    };
-    Ok((define("AUDIOCPP_ABI_VERSION_MAJOR")?, define("AUDIOCPP_ABI_VERSION_MINOR")?))
-}
-
-/// The library must have the same major ABI and at least the minor the
-/// bindings declare, or symbols the bindings reference may be missing.
-fn check_abi(header: &Path) -> Result<(), BoxError> {
-    let ours = abi_version(&bindings_header())?;
-    let theirs = abi_version(header)?;
-    if theirs.0 != ours.0 || theirs.1 < ours.1 {
-        return Err(format!(
-            "prebuilt ABI {}.{} is incompatible with bindings for {}.{}",
-            theirs.0, theirs.1, ours.0, ours.1
-        )
-        .into());
-    }
-    Ok(())
-}
-
-fn has_library(dir: &Path) -> bool {
-    ["libaudiocpp.so", "libaudiocpp.dylib", "audiocpp.lib", "libaudiocpp.dll.a"]
-        .iter()
-        .any(|name| dir.join(name).exists())
 }
 
 // ---------------------------------------------------------------------------
 // Source build
 // ---------------------------------------------------------------------------
-
-fn bindings_header() -> PathBuf {
-    PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("include/audiocpp.h")
-}
 
 fn source_dir() -> PathBuf {
     if let Some(dir) = env::var_os("AUDIOCPP_SRC_DIR") {
@@ -315,44 +517,133 @@ fn source_dir() -> PathBuf {
         }
         return dir;
     }
-    let root = out_dir().join("source");
-    let source = root.join(format!("audio.cpp-{SOURCE_COMMIT}"));
-    if source.join(".complete").exists() {
+    let cache = cache_dir("source");
+    let source = cache.join(format!("audio.cpp-{SOURCE_COMMIT}"));
+    let marker = source.join(".complete");
+    if marker.exists() {
+        return source;
+    }
+    let _lock = CacheLock::acquire(&source).unwrap_or_else(|e| panic!("cannot lock {}: {e}", source.display()));
+    if marker.exists() {
         return source;
     }
     if offline() {
-        panic!("cargo is offline and no audio.cpp source is available; set AUDIOCPP_SRC_DIR or AUDIOCPP_LIB_DIR");
+        panic!("offline, and the audio.cpp source is not cached; set AUDIOCPP_SRC_DIR or AUDIOCPP_LIB_DIR");
     }
-    if root.exists() {
-        fs::remove_dir_all(&root).unwrap();
+    // Unpack into a staging directory and rename, so an interrupted download
+    // never leaves a tree that looks complete.
+    let staging = cache.join(format!(".staging-{SOURCE_COMMIT}"));
+    if staging.exists() {
+        fs::remove_dir_all(&staging).unwrap();
     }
-    fs::create_dir_all(&root).unwrap();
+    if source.exists() {
+        fs::remove_dir_all(&source).unwrap();
+    }
+    fs::create_dir_all(&staging).unwrap();
     let url = format!("https://github.com/{UPSTREAM}/archive/{SOURCE_COMMIT}.tar.gz");
     let result: Result<(), BoxError> = (|| {
         let mut response = get(&url)?;
-        tar::Archive::new(flate2::read::GzDecoder::new(response.body_mut().as_reader())).unpack(&root)?;
+        tar::Archive::new(flate2::read::GzDecoder::new(response.body_mut().as_reader())).unpack(&staging)?;
         Ok(())
     })();
     if let Err(e) = result {
+        fs::remove_dir_all(&staging).ok();
         panic!("failed to download audio.cpp source from {url}: {e}");
     }
+    let unpacked = staging.join(format!("audio.cpp-{SOURCE_COMMIT}"));
     // The pinned commit must carry exactly the header the bindings were
     // generated from; anything else means the pin and the snapshot drifted.
     let normalize = |path: &Path| fs::read_to_string(path).map(|text| text.replace("\r\n", "\n"));
-    if normalize(&source.join("include/audiocpp.h")).ok() != normalize(&bindings_header()).ok() {
-        fs::remove_dir_all(&root).ok();
+    if normalize(&unpacked.join("include/audiocpp.h")).ok() != normalize(&bindings_header()).ok() {
+        fs::remove_dir_all(&staging).ok();
         panic!(
             "audiocpp.h at {SOURCE_COMMIT} differs from include/audiocpp.h; update the pin or regenerate the bindings"
         );
     }
-    fs::write(source.join(".complete"), SOURCE_COMMIT).unwrap();
+    fs::rename(&unpacked, &source).unwrap();
+    fs::remove_dir_all(&staging).ok();
+    fs::write(&marker, SOURCE_COMMIT).unwrap();
     source
 }
 
-/// CMake refuses a build tree configured for another source directory, which
-/// happens when switching between AUDIOCPP_SRC_DIR and the downloaded source.
-fn discard_stale_cmake_cache(source: &Path) {
-    let build = out_dir().join("build");
+/// Everything that changes the native build's output, hashed into the cache key.
+fn build_key(defines: &[(String, String)]) -> String {
+    let mut hasher = Sha256::new();
+    let mut add = |label: &str, value: &str| {
+        hasher.update(label.as_bytes());
+        hasher.update([0]);
+        hasher.update(value.as_bytes());
+        hasher.update([0]);
+    };
+    add("layout", &CACHE_LAYOUT.to_string());
+    add("commit", SOURCE_COMMIT);
+    add("target", &env::var("TARGET").unwrap_or_default());
+    for (key, value) in defines {
+        add(key, value);
+    }
+    for var in ["CC", "CXX", "CFLAGS", "CXXFLAGS", "CMAKE_GENERATOR", "CMAKE_TOOLCHAIN_FILE", "VULKAN_SDK", "CUDA_PATH"]
+    {
+        add(var, &env::var(var).unwrap_or_default());
+    }
+    hex(&hasher.finalize())[..16].to_string()
+}
+
+fn cmake_defines() -> Vec<(String, String)> {
+    let on_off = |enabled: bool| if enabled { "ON" } else { "OFF" }.to_string();
+    let mut defines = vec![
+        ("AUDIOCPP_BUILD_C_API".into(), "ON".into()),
+        // Compile model specs into the library, so it does not look for a
+        // model_specs directory next to wherever it is deployed.
+        ("AUDIOCPP_DEPLOYMENT_BUILD".into(), "ON".into()),
+        ("ENGINE_ENABLE_CUDA".into(), on_off(feature("cuda"))),
+        ("ENGINE_ENABLE_HIP".into(), on_off(feature("hip"))),
+        ("ENGINE_ENABLE_VULKAN".into(), on_off(feature("vulkan"))),
+        ("ENGINE_ENABLE_METAL".into(), on_off(feature("metal"))),
+        ("ENGINE_ENABLE_OPENMP".into(), on_off(feature("openmp"))),
+        ("ENGINE_ENABLE_NATIVE_CPU".into(), on_off(feature("native"))),
+        ("ENGINE_BUILD_EXAMPLES".into(), "OFF".into()),
+        ("ENGINE_BUILD_TESTS".into(), "OFF".into()),
+    ];
+    if let Ok(set) = env::var("AUDIOCPP_MODEL_SET") {
+        defines.push(("AUDIOCPP_MODEL_SET".into(), set));
+    }
+    if let Ok(models) = env::var("AUDIOCPP_MODELS") {
+        defines.push(("AUDIOCPP_MODELS".into(), models));
+    }
+    if let Ok(args) = env::var("AUDIOCPP_CMAKE_ARGS") {
+        for arg in args.split_whitespace() {
+            let define = arg.strip_prefix("-D").unwrap_or(arg);
+            match define.split_once('=') {
+                // Drop a `:TYPE` suffix; cmake::Config::define adds none.
+                Some((key, value)) => defines.push((key.split_once(':').map_or(key, |(k, _)| k).into(), value.into())),
+                None => panic!("AUDIOCPP_CMAKE_ARGS entry is not -DKEY=VALUE: {arg}"),
+            }
+        }
+    }
+    defines
+}
+
+/// Refuses cross builds CMake cannot do on its own: different operating
+/// systems need a toolchain file. Apple's compilers build either macOS
+/// architecture, which the cmake crate selects.
+fn check_cross_build() {
+    let (host, target) = (env::var("HOST").unwrap_or_default(), env::var("TARGET").unwrap_or_default());
+    if host == target || env::var_os("CMAKE_TOOLCHAIN_FILE").is_some() {
+        return;
+    }
+    let apple = |triple: &str| triple.ends_with("apple-darwin");
+    if apple(&host) && apple(&target) {
+        return;
+    }
+    panic!(
+        "building audio.cpp from source for {target} on {host} needs CMAKE_TOOLCHAIN_FILE, \
+         or point AUDIOCPP_LIB_DIR at a library built for {target}"
+    );
+}
+
+/// CMake refuses a build tree configured for another source directory.
+fn discard_stale_cmake_cache(build_root: &Path, source: &Path) {
+    let build = build_root.join("build");
     let Ok(cache) = fs::read_to_string(build.join("CMakeCache.txt")) else { return };
     let configured = cache.lines().find_map(|line| line.strip_prefix("CMAKE_HOME_DIRECTORY:INTERNAL="));
     let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
@@ -364,69 +655,63 @@ fn discard_stale_cmake_cache(source: &Path) {
     }
 }
 
+/// Upstream sends libraries and runtimes to `<build>/bin`, possibly under a
+/// per-configuration directory for multi-config generators (Visual Studio).
+fn built_lib_dir(build_root: &Path) -> Option<PathBuf> {
+    let bin = build_root.join("build").join("bin");
+    [bin.join("Release"), bin].into_iter().find(|dir| has_library(dir))
+}
+
 fn build_from_source() -> PathBuf {
+    check_cross_build();
     let source = source_dir();
     if !source.join("CMakeLists.txt").exists() {
         panic!("no audio.cpp CMakeLists.txt under {}", source.display());
     }
-    if env::var_os("AUDIOCPP_SRC_DIR").is_some() {
+    let defines = cmake_defines();
+
+    // A local tree changes under us, so its builds are not cached across
+    // checkouts; the pinned commit's are.
+    let local = env::var_os("AUDIOCPP_SRC_DIR").is_some();
+    let build_root = if local {
         for path in ["CMakeLists.txt", "include", "src", "external/ggml", "model_specs"] {
             println!("cargo:rerun-if-changed={}", source.join(path).display());
         }
+        out_dir().join("native")
+    } else {
+        cache_dir("native").join(build_key(&defines))
+    };
+    let _lock = (!local).then(|| CacheLock::acquire(&build_root).unwrap_or_else(|e| panic!("cannot lock cache: {e}")));
+    let marker = build_root.join(".complete");
+    if !local && marker.exists() {
+        if let Some(dir) = built_lib_dir(&build_root) {
+            return dir;
+        }
     }
-    discard_stale_cmake_cache(&source);
+    fs::create_dir_all(&build_root).unwrap();
+    discard_stale_cmake_cache(&build_root, &source);
 
-    let on_off = |enabled: bool| if enabled { "ON" } else { "OFF" };
     let mut config = cmake::Config::new(&source);
     config
+        .out_dir(&build_root)
         // An unoptimised inference engine is unusable, whatever the Rust profile.
         .profile("Release")
         .build_target("audiocpp")
-        .define("AUDIOCPP_BUILD_C_API", "ON")
-        .define("ENGINE_ENABLE_CUDA", on_off(feature("cuda")))
-        .define("ENGINE_ENABLE_HIP", on_off(feature("hip")))
-        .define("ENGINE_ENABLE_VULKAN", on_off(feature("vulkan")))
-        .define("ENGINE_ENABLE_METAL", on_off(feature("metal")))
-        .define("ENGINE_ENABLE_OPENMP", on_off(feature("openmp")))
-        .define("ENGINE_ENABLE_NATIVE_CPU", on_off(feature("native")))
-        // Compile model specs into the library, so it does not look for a
-        // model_specs directory next to wherever it is deployed.
-        .define("AUDIOCPP_DEPLOYMENT_BUILD", "ON")
-        .define("ENGINE_BUILD_EXAMPLES", "OFF")
-        .define("ENGINE_BUILD_TESTS", "OFF");
-
+        .define("CMAKE_PROJECT_AudioCpp_INCLUDE", manifest_dir().join("cmake/short-paths.cmake"));
+    for (key, value) in &defines {
+        config.define(key, value);
+    }
     if env::var("CARGO_CFG_TARGET_ENV").is_ok_and(|e| e == "msvc") {
         // Upstream sources contain non-ASCII literals; MSVC otherwise decodes
         // them with the machine's ANSI code page.
         config.cflag("/utf-8").cxxflag("/utf-8");
     }
-    if let Ok(set) = env::var("AUDIOCPP_MODEL_SET") {
-        config.define("AUDIOCPP_MODEL_SET", set);
-    }
-    if let Ok(models) = env::var("AUDIOCPP_MODELS") {
-        config.define("AUDIOCPP_MODELS", models);
-    }
-    if let Ok(args) = env::var("AUDIOCPP_CMAKE_ARGS") {
-        for arg in args.split_whitespace() {
-            let define = arg.strip_prefix("-D").unwrap_or(arg);
-            match define.split_once('=') {
-                Some((key, value)) => {
-                    // Drop a `:TYPE` suffix; cmake::Config::define adds none.
-                    let key = key.split_once(':').map_or(key, |(k, _)| k);
-                    config.define(key, value);
-                }
-                None => panic!("AUDIOCPP_CMAKE_ARGS entry is not -DKEY=VALUE: {arg}"),
-            }
-        }
-    }
+    config.build();
 
-    let out = config.build();
-    // Upstream sends both libraries and runtimes to <build>/bin. On Windows the
-    // import library also lands there, possibly under a per-configuration
-    // subdirectory for multi-config generators.
-    let bin = out.join("build").join("bin");
-    [bin.join("Release"), bin.clone()]
-        .into_iter()
-        .find(|dir| has_library(dir))
-        .unwrap_or_else(|| panic!("libaudiocpp was not found under {}", bin.display()))
+    let dir = built_lib_dir(&build_root)
+        .unwrap_or_else(|| panic!("libaudiocpp was not found under {}", build_root.join("build/bin").display()));
+    if !local {
+        fs::write(&marker, SOURCE_COMMIT).unwrap();
+    }
+    dir
 }

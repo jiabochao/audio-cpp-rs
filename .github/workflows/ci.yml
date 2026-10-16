@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all --check
+      - name: Catalog matches the pinned commit
+        run: |
+          commit=$(sed -n 's/^const SOURCE_COMMIT: &str = "\([0-9a-f]\{40\}\)";$/\1/p' audio-cpp-sys/build.rs)
+          grep -q "\"source_commit\":\"$commit\"" src/catalog/model_specs.json
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/audio-cpp-rs
+          key: audiocpp-${{ runner.os }}-lint-${{ hashFiles('audio-cpp-sys/build.rs') }}
+      - run: cargo clippy --workspace --all-targets --features resample,decode
+      - run: cargo doc --workspace --no-deps --features resample,decode
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  test:
+    name: test / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Prebuilt library cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/audio-cpp-rs
+            ~/Library/Caches/audio-cpp-rs
+            ~/AppData/Local/audio-cpp-rs
+          key: audiocpp-${{ runner.os }}-${{ hashFiles('audio-cpp-sys/build.rs', 'audio-cpp-sys/cmake/*') }}
+      - run: cargo test --workspace --features resample,decode
+      - run: cargo run --example vad
+      - run: cargo run --example catalog -- qwen3_tts
+
+  source-build:
+    # The default path downloads the pinned prebuilt library; this job keeps
+    # the CMake fallback honest. The core model set (bundled VAD models)
+    # builds in minutes and is all the tests need.
+    runs-on: ubuntu-latest
+    env:
+      AUDIOCPP_BUILD: source
+      AUDIOCPP_MODEL_SET: core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/audio-cpp-rs
+          key: audiocpp-${{ runner.os }}-source-${{ hashFiles('audio-cpp-sys/build.rs', 'audio-cpp-sys/cmake/*') }}
+      - run: cargo test --workspace --features resample,decode
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/audio-cpp-rs
+          key: audiocpp-${{ runner.os }}-msrv-${{ hashFiles('audio-cpp-sys/build.rs') }}
+      - run: cargo check --workspace --all-targets --features resample,decode
+        env:
+          RUSTFLAGS: ""
+
+  git-dependency:
+    # What a downstream project sees: a git dependency, no environment
+    # variables, an empty Cargo home. Catches anything that only works inside
+    # this checkout (submodules, relative paths, files missing from git).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: audio-cpp-rs
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/audio-cpp-rs
+          key: audiocpp-${{ runner.os }}-consumer-${{ hashFiles('audio-cpp-rs/audio-cpp-sys/build.rs') }}
+      - name: Build and run a consumer
+        env:
+          CARGO_HOME: ${{ runner.temp }}/cargo-home
+          RUSTFLAGS: ""
+        run: |
+          cargo new --quiet consumer
+          cd consumer
+          echo "audio-cpp = { git = \"file://$GITHUB_WORKSPACE/audio-cpp-rs\", rev = \"$(git -C ../audio-cpp-rs rev-parse HEAD)\" }" >> Cargo.toml
+          cat > src/main.rs <<'RS'
+          fn main() {
+              let registry = audio_cpp::Registry::new().unwrap();
+              let families = registry.families().unwrap();
+              assert!(families.iter().any(|f| f == "silero_vad"), "{families:?}");
+              println!("audio.cpp {} ABI {}: {families:?}", audio_cpp::build_version(), audio_cpp::abi_version());
+          }
+          RS
+          cargo run

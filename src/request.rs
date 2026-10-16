@@ -1,44 +1,24 @@
 use std::ffi::c_char;
 use std::ptr::NonNull;
 
+use crate::audio::AudioRef;
 use crate::error::{Error, Result, check};
-use crate::model::allocation_failed;
+use crate::ffi::{allocation_failed, c_string, handle, opt_c_string, opt_ptr};
 use crate::result::ArtifactKind;
-use crate::{c_string, handle, opt_c_string, opt_ptr, sys};
+use crate::sys;
 
 handle!(
     /// The inputs for one task run: text, audio, a speaker reference, style
     /// conditioning, artifacts and free-form options.
     ///
     /// Setters copy their arguments and return `&mut Self` for chaining.
-    Request,
+    pub Request,
     sys::audiocpp_request,
     sys::audiocpp_request_free
 );
 
-/// Frame count for interleaved samples, rejecting partial frames.
-pub(crate) fn frames(samples: &[f32], channels: u32) -> Result<usize> {
-    if channels == 0 {
-        return Err(Error::invalid_argument("channels must be positive"));
-    }
-    if samples.len() % channels as usize != 0 {
-        return Err(Error::invalid_argument(format!(
-            "{} samples is not a whole number of {channels}-channel frames",
-            samples.len()
-        )));
-    }
-    Ok(samples.len() / channels as usize)
-}
-
 fn finite(value: f32, what: &str) -> Result<f32> {
     if value.is_finite() { Ok(value) } else { Err(Error::invalid_argument(format!("{what} must be finite"))) }
-}
-
-pub(crate) fn positive_i32(value: u32, what: &str) -> Result<i32> {
-    i32::try_from(value)
-        .ok()
-        .filter(|&v| v > 0)
-        .ok_or_else(|| Error::invalid_argument(format!("{what} must be in 1..={}", i32::MAX)))
 }
 
 impl Request {
@@ -46,6 +26,20 @@ impl Request {
         // SAFETY: no preconditions.
         let ptr = unsafe { sys::audiocpp_request_create() };
         NonNull::new(ptr).map(|ptr| Self { ptr }).ok_or_else(|| allocation_failed("request"))
+    }
+
+    /// A request carrying only `text`, the usual start for TTS.
+    pub fn with_text(text: &str) -> Result<Self> {
+        let mut request = Self::new()?;
+        request.set_text(text, None)?;
+        Ok(request)
+    }
+
+    /// A request carrying only input audio, the usual start for ASR or VAD.
+    pub fn with_audio(audio: AudioRef<'_>) -> Result<Self> {
+        let mut request = Self::new()?;
+        request.set_audio(audio)?;
+        Ok(request)
     }
 
     /// Sets the text. A non-empty `language` is also written to the
@@ -67,22 +61,23 @@ impl Request {
         Ok(self)
     }
 
-    /// Sets the input audio: interleaved float PCM, `samples.len()` must be a
-    /// multiple of `channels`.
-    pub fn set_audio(&mut self, samples: &[f32], sample_rate: u32, channels: u32) -> Result<&mut Self> {
-        let frames = frames(samples, channels)?;
-        let (rate, ch) = (positive_i32(sample_rate, "sample_rate")?, positive_i32(channels, "channels")?);
-        // SAFETY: the slice covers frames * channels floats; copied.
-        check(unsafe { sys::audiocpp_request_set_audio(self.as_ptr(), samples.as_ptr(), frames, rate, ch) })?;
+    /// Sets the input audio (ASR, VAD, separation, conversion, ...). Copied.
+    pub fn set_audio(&mut self, audio: AudioRef<'_>) -> Result<&mut Self> {
+        let (frames, rate, channels) = audio.ffi_layout()?;
+        // SAFETY: the slice covers frames * channels floats; copied by the library.
+        check(unsafe {
+            sys::audiocpp_request_set_audio(self.as_ptr(), audio.samples.as_ptr(), frames, rate, channels)
+        })?;
         Ok(self)
     }
 
-    /// Sets the speaker reference audio, for cloning/conversion families.
-    pub fn set_voice_audio(&mut self, samples: &[f32], sample_rate: u32, channels: u32) -> Result<&mut Self> {
-        let frames = frames(samples, channels)?;
-        let (rate, ch) = (positive_i32(sample_rate, "sample_rate")?, positive_i32(channels, "channels")?);
+    /// Sets the speaker reference audio, for cloning and conversion. Copied.
+    pub fn set_voice_audio(&mut self, audio: AudioRef<'_>) -> Result<&mut Self> {
+        let (frames, rate, channels) = audio.ffi_layout()?;
         // SAFETY: as above.
-        check(unsafe { sys::audiocpp_request_set_voice_audio(self.as_ptr(), samples.as_ptr(), frames, rate, ch) })?;
+        check(unsafe {
+            sys::audiocpp_request_set_voice_audio(self.as_ptr(), audio.samples.as_ptr(), frames, rate, channels)
+        })?;
         Ok(self)
     }
 
