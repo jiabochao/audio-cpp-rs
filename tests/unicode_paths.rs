@@ -3,7 +3,8 @@
 //! Unix passes path bytes through. On Windows the library can only open such
 //! a path when the process runs under the UTF-8 code page; otherwise the
 //! bindings refuse it with an error naming the fix (see `src/winpath.rs`).
-//! CI runs under code page 1252, which checks that error.
+//! Windows CI runs it twice: under code page 1252, which checks that error,
+//! and linked with `tests/utf8.manifest`, which checks that the load works.
 
 use std::path::{Path, PathBuf};
 
@@ -38,6 +39,11 @@ fn loads_a_model_from_a_non_ascii_directory() {
     let model: PathBuf = root.join("语音检测").join("silero_vad");
     copy_dir(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/silero_vad"), &model);
 
+    // Set by the CI step that links the UTF-8 manifest, so a manifest that
+    // failed to take effect cannot pass as the refusal case.
+    if std::env::var_os("AUDIOCPP_TEST_EXPECT_UTF8").is_some() {
+        assert!(utf8_code_page(), "the UTF-8 manifest did not take effect");
+    }
     let registry = Registry::new().unwrap();
     let loaded = registry.load_model(&model, &ModelConfig::family("silero_vad"), None);
     std::fs::remove_dir_all(&root).ok();

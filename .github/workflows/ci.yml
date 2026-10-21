@@ -61,6 +61,17 @@ jobs:
       - run: cargo test --workspace --features resample,decode
       - run: cargo run --example vad
       - run: cargo run --example catalog -- qwen3_tts
+      # The application-side fix for non-ASCII paths on Windows: the same
+      # test, linked with a manifest selecting the UTF-8 code page, must load
+      # the model where the default code page is refused.
+      - name: non-ASCII paths under the UTF-8 code page
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: target/utf8
+          AUDIOCPP_TEST_EXPECT_UTF8: 1
+          RUSTFLAGS: -C link-arg=/MANIFEST:EMBED -C link-arg=/MANIFESTINPUT:${{ github.workspace }}\tests\utf8.manifest
+        run: cargo test --test unicode_paths -- --nocapture
 
   source-build:
     # The default path downloads the pinned prebuilt library; this job keeps
