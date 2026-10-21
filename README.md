@@ -65,7 +65,13 @@ let spec = SessionSpec::new(model_dir, &ModelConfig::family("qwen3_tts"), Task::
     .session_option("qwen3_tts.voice_prompt_cache_slots", "8");
 let mut session = pool.checkout(&spec)?;   // reused while warm; returned on drop
 let result = session.run(&request)?;
+// Before the process exits:
+pool.shutdown(Duration::from_secs(5));
 ```
+
+Shut the pool down before the process exits. A session still alive at
+`exit()` is freed after the GPU backend's static teardown, and ggml's Metal
+backend aborts on that (`GGML_ASSERT([rsets->data count] == 0)`).
 
 **The model catalog.** Upstream's 120+ model specs are embedded:
 families, tasks, languages, typed options for building UIs, and packages with

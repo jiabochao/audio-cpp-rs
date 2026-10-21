@@ -6,6 +6,10 @@
 //! [`SessionSpec`], keeps at most [`PoolConfig::max_sessions`] resident, and
 //! evicts the least recently used idle session to make room. It frees before
 //! it creates, so peak memory stays at the limit rather than one past it.
+//!
+//! Call [`SessionPool::shutdown`] before the process exits. A session still
+//! alive at `exit()` outlives the GPU backend's static teardown, and ggml's
+//! Metal backend aborts on that (`GGML_ASSERT([rsets->data count] == 0)`).
 
 use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
@@ -174,6 +178,9 @@ struct State {
     idle: Vec<Idle>,
     in_use: Vec<SessionSpec>,
     creating: usize,
+    /// Set by [`SessionPool::shutdown`]: no new checkouts, returned sessions
+    /// are freed.
+    closed: bool,
 }
 
 impl State {
@@ -265,6 +272,9 @@ impl SessionPool {
     fn checkout_inner(&self, spec: &SessionSpec, wait: Wait<'_>) -> Result<PooledSession> {
         let mut state = self.inner.state();
         loop {
+            if state.closed {
+                return Err(Error::new(ErrorKind::Closed, "the session pool is shut down"));
+            }
             if let Wait::Cancellable(token) = &wait {
                 token.check()?;
             }
@@ -288,6 +298,12 @@ impl SessionPool {
                 let mut state = self.inner.state();
                 state.creating -= 1;
                 return match created {
+                    Ok(session) if state.closed => {
+                        drop(state);
+                        drop(session);
+                        self.inner.changed.notify_all();
+                        Err(Error::new(ErrorKind::Closed, "the session pool is shut down"))
+                    }
                     Ok(session) => {
                         state.in_use.push(spec.clone());
                         Ok(PooledSession { session: Some(session), spec: spec.clone(), pool: self.inner.clone() })
@@ -378,6 +394,44 @@ impl SessionPool {
         self.inner.changed.notify_all();
     }
 
+    /// Closes the pool and frees its sessions: idle ones now, ones in use as
+    /// their tasks return them. Waits up to `timeout` for those, and returns
+    /// whether every session is gone. Later checkouts, and those blocked
+    /// waiting, fail with [`ErrorKind::Closed`].
+    ///
+    /// Call it before the process exits (see [Resources](crate#resources)). A
+    /// session cannot be interrupted mid-inference, so if this returns
+    /// `false`, one is still running and the backend will be torn down under
+    /// it: exiting with `_exit` (skipping static destructors) is then safer
+    /// than `exit`.
+    pub fn shutdown(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let idle = {
+            let mut state = self.inner.state();
+            state.closed = true;
+            std::mem::take(&mut state.idle)
+        };
+        self.inner.changed.notify_all();
+        drop(idle);
+
+        let mut state = self.inner.state();
+        while !state.in_use.is_empty() || state.creating > 0 {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            state = self.inner.changed.wait_timeout(state, deadline - now).unwrap_or_else(PoisonError::into_inner).0;
+        }
+        drop(state);
+        self.inner.registry.lock().unwrap_or_else(PoisonError::into_inner).take();
+        true
+    }
+
+    /// Whether [`Self::shutdown`] was called.
+    pub fn is_closed(&self) -> bool {
+        self.inner.state().closed
+    }
+
     pub fn stats(&self) -> PoolStats {
         let state = self.inner.state();
         PoolStats {
@@ -421,9 +475,10 @@ impl PooledSession {
         if let Some(index) = state.in_use.iter().position(|spec| *spec == self.spec) {
             state.in_use.remove(index);
         }
-        let over_limit = state.resident() >= self.pool.config().max_sessions.max(1);
+        let over_limit = state.closed || state.resident() >= self.pool.config().max_sessions.max(1);
         let freed = match session {
-            // Over the limit (it was lowered while this was out): free it.
+            // Over the limit (it was lowered while this was out), or the pool
+            // is shut down: free it.
             Some(session) if over_limit => Some(session),
             Some(session) => {
                 state.idle.push(Idle { spec: self.spec.clone(), session, last_used: Instant::now() });

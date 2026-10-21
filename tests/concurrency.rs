@@ -155,3 +155,26 @@ fn pool_shrinks_when_the_limit_drops_and_expires_idle_sessions() {
     drop(pool.checkout(&spec(9)).unwrap());
     assert_eq!(pool.stats().idle, vec![spec(9)]);
 }
+
+#[test]
+fn pool_shutdown_frees_sessions_and_refuses_checkouts() {
+    let pool = SessionPool::new(PoolConfig { max_sessions: 2, idle_timeout: None });
+    drop(pool.checkout(&spec(1)).unwrap());
+    let busy = pool.checkout(&spec(2)).unwrap();
+
+    // A session still in use holds the shutdown back until it returns.
+    assert!(!pool.shutdown(Duration::from_millis(50)));
+    assert!(pool.is_closed());
+    assert!(pool.stats().idle.is_empty());
+    let waiter = std::thread::spawn({
+        let pool = pool.clone();
+        move || pool.shutdown(Duration::from_secs(10))
+    });
+    std::thread::sleep(Duration::from_millis(50));
+    drop(busy);
+    assert!(waiter.join().unwrap());
+
+    let stats = pool.stats();
+    assert!(stats.idle.is_empty() && stats.in_use.is_empty() && stats.creating == 0, "{stats:?}");
+    assert_eq!(pool.checkout(&spec(1)).unwrap_err().kind(), ErrorKind::Closed);
+}

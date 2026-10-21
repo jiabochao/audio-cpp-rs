@@ -55,7 +55,11 @@ let spec = SessionSpec::new(model_dir, &ModelConfig::family("qwen3_tts"), Task::
     .session_option("qwen3_tts.voice_prompt_cache_slots", "8");
 let mut session = pool.checkout(&spec)?;   // 常驻时直接复用；drop 时归还到池里
 let result = session.run(&request)?;
+// 进程退出前：
+pool.shutdown(Duration::from_secs(5));
 ```
+
+进程退出前要调用 `shutdown` 释放所有 Session。否则 Session 会活到 `exit()` 之后、比 GPU 后端的静态析构更晚释放，ggml 的 Metal 后端会因此断言崩溃（`GGML_ASSERT([rsets->data count] == 0)`）。
 
 **模型目录。** 内嵌了上游 120 多个模型的 spec：家族、任务、语言、可直接用来生成界面控件的类型化参数，以及每个下载包的文件清单和 Hugging Face / ModelScope 下载地址。查询目录不需要联网，也不调用原生库。
 

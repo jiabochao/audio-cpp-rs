@@ -35,6 +35,10 @@
 //! application: it keeps sessions warm, bounds how many are resident, and
 //! evicts the least recently used.
 //!
+//! Free every session before the process exits ([`SessionPool::shutdown`]
+//! for pooled ones): one that outlives `exit()` is freed after the GPU
+//! backend's static teardown, which ggml's Metal backend aborts on.
+//!
 //! # Threading
 //!
 //! Handles are [`Send`] but not [`Sync`]: a session can move to a worker

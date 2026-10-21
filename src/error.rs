@@ -27,6 +27,8 @@ pub enum ErrorKind {
     Cancelled,
     /// Waiting for a pooled session timed out.
     Timeout,
+    /// The [`crate::SessionPool`] was shut down.
+    Closed,
     /// A status code this version of the bindings does not know about.
     Other(u32),
 }
@@ -57,6 +59,7 @@ impl ErrorKind {
             Self::IncompatibleAbi => "incompatible library ABI",
             Self::Cancelled => "cancelled",
             Self::Timeout => "timed out",
+            Self::Closed => "closed",
             Self::Other(_) => "unknown status",
         }
     }
