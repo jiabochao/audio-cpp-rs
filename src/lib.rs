@@ -96,6 +96,8 @@ mod request;
 mod result;
 mod session;
 mod task;
+#[cfg(windows)]
+mod winpath;
 
 pub use audio_cpp_sys as sys;
 

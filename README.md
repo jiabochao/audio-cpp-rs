@@ -190,6 +190,14 @@ in `DEP_AUDIOCPP_LIB_DIR` next to the executable:
   with an `@executable_path/../Frameworks` rpath.
 - **Linux**: next to the binary with an `$ORIGIN` rpath, or on the loader path.
 
+**Windows: non-ASCII paths.** The library reads paths in the process code
+page, which cannot spell a path like `C:\Users\张三\…` on most systems. The
+bindings handle this for you: they pass such a path's 8.3 alias (ASCII, kept
+by system drives by default), and return an `InvalidArgument` error that says
+so when there is none, rather than loading the wrong file. An executable that
+selects UTF-8 in its manifest (`<activeCodePage>UTF-8</activeCodePage>`,
+Windows 10 1903+) needs neither.
+
 ## Development
 
 ```sh

@@ -52,9 +52,9 @@ pub(crate) fn path_c_string(path: &Path) -> Result<CString> {
         use std::os::unix::ffi::OsStrExt;
         path.as_os_str().as_bytes().to_vec()
     };
-    // The library decodes paths as UTF-8 on Windows, so a non-UTF-8 path
-    // could only name the wrong file.
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    let bytes = crate::winpath::encode(path)?;
+    #[cfg(not(any(unix, windows)))]
     let bytes = path
         .to_str()
         .ok_or_else(|| Error::invalid_argument(format!("path is not valid UTF-8: {}", path.display())))?
