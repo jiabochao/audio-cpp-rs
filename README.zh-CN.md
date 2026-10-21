@@ -151,7 +151,17 @@ for file in package.files()? {
 - **macOS**：放进 `Contents/Frameworks`（Tauri 用 `bundle.macOS.frameworks` 配置），并设置 `@executable_path/../Frameworks` 的 rpath；
 - **Linux**：放在可执行文件旁并设置 `$ORIGIN` 的 rpath，或放在系统动态库搜索路径里。
 
-**Windows 上的非 ASCII 路径。** 上游库按进程代码页解析路径，大多数系统上的代码页表示不了 `C:\Users\张三\…` 这样的路径。绑定会自动处理：改传该路径的 8.3 短名（全是 ASCII，系统盘默认保留短名）；拿不到短名时返回 `InvalidArgument` 错误并说明原因，而不是加载到错误的文件。如果可执行文件在 manifest 里选用了 UTF-8 代码页（`<activeCodePage>UTF-8</activeCodePage>`，Windows 10 1903 及以上），则不需要这些处理。
+**Windows 上的非 ASCII 路径。** 上游库按进程代码页解析路径，所以模型放在 `C:\Users\张三\…` 这类路径下时，可执行文件必须在 manifest 里选用 UTF-8 代码页（Windows 10 1903 及以上）：
+
+```xml
+<application xmlns="urn:schemas-microsoft-com:asm.v3">
+  <windowsSettings>
+    <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+  </windowsSettings>
+</application>
+```
+
+没有这项配置时，绑定会直接拒绝这类路径，返回 `InvalidArgument` 错误并说明原因，而不是让它莫名其妙地失败或打开别的文件。（改传 8.3 短路径也不行：上游加载时会把短路径规范化回长路径。）
 
 ## 开发
 

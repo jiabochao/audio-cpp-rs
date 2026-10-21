@@ -191,12 +191,21 @@ in `DEP_AUDIOCPP_LIB_DIR` next to the executable:
 - **Linux**: next to the binary with an `$ORIGIN` rpath, or on the loader path.
 
 **Windows: non-ASCII paths.** The library reads paths in the process code
-page, which cannot spell a path like `C:\Users\张三\…` on most systems. The
-bindings handle this for you: they pass such a path's 8.3 alias (ASCII, kept
-by system drives by default), and return an `InvalidArgument` error that says
-so when there is none, rather than loading the wrong file. An executable that
-selects UTF-8 in its manifest (`<activeCodePage>UTF-8</activeCodePage>`,
-Windows 10 1903+) needs neither.
+page, so a model under `C:\Users\张三\…` only loads when the executable
+selects UTF-8 in its manifest (Windows 10 1903+):
+
+```xml
+<application xmlns="urn:schemas-microsoft-com:asm.v3">
+  <windowsSettings>
+    <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+  </windowsSettings>
+</application>
+```
+
+Without it the bindings refuse such a path with an `InvalidArgument` error
+saying so, rather than letting it fail obscurely or load another file. (The
+8.3 alias is no way around this: the loaders canonicalize it back to the long
+name.)
 
 ## Development
 

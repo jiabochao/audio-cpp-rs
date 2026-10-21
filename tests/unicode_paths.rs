@@ -1,9 +1,9 @@
 //! Models under non-ASCII paths, such as a Windows profile named `张三`.
 //!
-//! On Windows this runs under the runner's ANSI code page (1252), where the
-//! library cannot read such a path itself, so it exercises the bindings'
-//! fallback to the 8.3 alias (see `src/winpath.rs`) — the situation of an
-//! application that does not select UTF-8 in its manifest.
+//! Unix passes path bytes through. On Windows the library can only open such
+//! a path when the process runs under the UTF-8 code page; otherwise the
+//! bindings refuse it with an error naming the fix (see `src/winpath.rs`).
+//! CI runs under code page 1252, which checks that error.
 
 use std::path::{Path, PathBuf};
 
@@ -17,6 +17,21 @@ fn copy_dir(from: &Path, to: &Path) {
     }
 }
 
+#[cfg(windows)]
+fn utf8_code_page() -> bool {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetACP() -> u32;
+    }
+    // SAFETY: no arguments; reads process state.
+    unsafe { GetACP() == 65001 }
+}
+
+#[cfg(not(windows))]
+fn utf8_code_page() -> bool {
+    true
+}
+
 #[test]
 fn loads_a_model_from_a_non_ascii_directory() {
     let root = std::env::temp_dir().join(format!("audio-cpp 模型 Ünïcode {}", std::process::id()));
@@ -26,6 +41,11 @@ fn loads_a_model_from_a_non_ascii_directory() {
     let registry = Registry::new().unwrap();
     let loaded = registry.load_model(&model, &ModelConfig::family("silero_vad"), None);
     std::fs::remove_dir_all(&root).ok();
-    let loaded = loaded.unwrap();
-    assert_eq!(loaded.info().unwrap().family, "silero_vad");
+    if utf8_code_page() {
+        assert_eq!(loaded.unwrap().info().unwrap().family, "silero_vad");
+    } else {
+        let error = loaded.expect_err("a non-ASCII path must be refused outside the UTF-8 code page");
+        assert_eq!(error.kind(), audio_cpp::ErrorKind::InvalidArgument);
+        assert!(error.to_string().contains("activeCodePage"), "{error}");
+    }
 }
