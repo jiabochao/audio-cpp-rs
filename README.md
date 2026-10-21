@@ -56,8 +56,9 @@ for you.
 weights to the device — seconds and gigabytes for large models — while
 loading a `Model` is cheap. `SessionPool` keeps sessions warm per
 `SessionSpec`, bounds how many are resident, evicts the least recently used
-one, frees *before* it creates so memory peaks at the limit, and can wait
-with a timeout or a `CancelToken`.
+one, frees *before* it creates so memory peaks at the limit, frees idle
+sessions in the background once `idle_timeout` passes, and can wait with a
+timeout or a `CancelToken`.
 
 ```rust
 let pool = SessionPool::new(PoolConfig { max_sessions: 2, idle_timeout: Some(Duration::from_secs(600)) });

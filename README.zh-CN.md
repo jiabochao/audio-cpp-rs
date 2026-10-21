@@ -47,6 +47,7 @@ if let Some(audio) = result.audio()? {
 - 按 `SessionSpec` 复用常驻的 Session；
 - 限制常驻数量，满了就按 LRU 驱逐空闲的；
 - 先释放再创建，内存峰值不超过上限；
+- 设置 `idle_timeout` 后，后台线程会按时释放空闲的 Session，应用闲下来时自动归还内存；
 - 需要等待时，支持超时和 `CancelToken` 取消。
 
 ```rust

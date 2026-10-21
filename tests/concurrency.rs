@@ -178,3 +178,29 @@ fn pool_shutdown_frees_sessions_and_refuses_checkouts() {
     assert!(stats.idle.is_empty() && stats.in_use.is_empty() && stats.creating == 0, "{stats:?}");
     assert_eq!(pool.checkout(&spec(1)).unwrap_err().kind(), ErrorKind::Closed);
 }
+
+#[test]
+fn pool_frees_expired_sessions_without_further_checkouts() {
+    let pool = SessionPool::new(PoolConfig { max_sessions: 2, idle_timeout: None });
+    drop(pool.checkout(&spec(1)).unwrap());
+    // Turning the timeout on later starts the background reaper too.
+    pool.set_config(PoolConfig { max_sessions: 2, idle_timeout: Some(Duration::from_millis(150)) });
+    drop(pool.checkout(&spec(2)).unwrap());
+    assert_eq!(pool.stats().idle.len(), 2);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !pool.stats().idle.is_empty() {
+        assert!(std::time::Instant::now() < deadline, "idle sessions were never freed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // A session that goes idle after the reaper has gone to sleep with
+    // nothing to watch is freed too.
+    drop(pool.checkout(&spec(3)).unwrap());
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !pool.stats().idle.is_empty() {
+        assert!(std::time::Instant::now() < deadline, "the reaper missed a new idle session");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(pool.checkout(&spec(1)).is_ok());
+}

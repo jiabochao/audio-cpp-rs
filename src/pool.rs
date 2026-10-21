@@ -6,6 +6,9 @@
 //! [`SessionSpec`], keeps at most [`PoolConfig::max_sessions`] resident, and
 //! evicts the least recently used idle session to make room. It frees before
 //! it creates, so peak memory stays at the limit rather than one past it.
+//! With [`PoolConfig::idle_timeout`] set, a background thread frees idle
+//! sessions once they expire, so an application that goes quiet gives its
+//! memory back without having to call anything.
 //!
 //! Call [`SessionPool::shutdown`] before the process exits. A session still
 //! alive at `exit()` outlives the GPU backend's static teardown, and ggml's
@@ -15,7 +18,8 @@ use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
+use std::thread::Thread;
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, ErrorKind, Result};
@@ -146,8 +150,9 @@ pub struct PoolConfig {
     /// Sessions resident at once, idle or in use. Each holds a full copy of
     /// its model's weights. At least 1.
     pub max_sessions: usize,
-    /// Idle sessions unused for this long are freed. `None` keeps them until
-    /// space is needed.
+    /// Idle sessions unused for this long are freed, by a background thread
+    /// the pool starts when this is first set. `None` keeps them until space
+    /// is needed.
     pub idle_timeout: Option<Duration>,
 }
 
@@ -194,6 +199,8 @@ struct Inner {
     changed: Condvar,
     config: Mutex<PoolConfig>,
     registry: Mutex<Option<Registry>>,
+    /// The thread that frees expired idle sessions, once started.
+    reaper: Mutex<Option<Thread>>,
 }
 
 impl Inner {
@@ -213,6 +220,74 @@ impl Inner {
         }
         spec.create(registry.as_ref().expect("registry initialized above"))
     }
+
+    /// Frees idle sessions past the configured timeout. Returns when the
+    /// next one expires, or `None` if no idle session is waiting to.
+    fn evict_expired(&self) -> Option<Instant> {
+        let timeout = self.config().idle_timeout;
+        let (expired, next) = {
+            let mut state = self.state();
+            let expired = SessionPool::expire(&mut state, timeout);
+            let next = timeout.and_then(|t| state.idle.iter().map(|idle| idle.last_used + t).min());
+            (expired, next)
+        };
+        if !expired.is_empty() {
+            drop(expired);
+            self.changed.notify_all();
+        }
+        next
+    }
+
+    /// Wakes the reaper to recompute its deadline (config changed, a session
+    /// went idle, or the pool is going away).
+    fn wake_reaper(&self) {
+        if let Some(thread) = &*self.reaper.lock().unwrap_or_else(PoisonError::into_inner) {
+            thread.unpark();
+        }
+    }
+
+    /// Starts the reaper if an idle timeout is set and it is not running.
+    fn ensure_reaper(self: &Arc<Self>) {
+        if self.config().idle_timeout.is_none() {
+            return;
+        }
+        let mut slot = self.reaper.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(thread) = &*slot {
+            thread.unpark();
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        // Without the thread, expiry still happens on the next checkout.
+        if let Ok(handle) = std::thread::Builder::new().name("audio-cpp-pool-reaper".into()).spawn(move || reap(weak)) {
+            *slot = Some(handle.thread().clone());
+        }
+    }
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // The reaper only holds a weak reference; let it notice and exit.
+        self.wake_reaper();
+    }
+}
+
+/// The reaper's loop. It keeps only a weak reference between rounds, so the
+/// pool is freed once its last handle is dropped, and exits then or on
+/// shutdown.
+fn reap(pool: Weak<Inner>) {
+    loop {
+        let next = {
+            let Some(inner) = pool.upgrade() else { return };
+            if inner.state().closed {
+                return;
+            }
+            inner.evict_expired()
+        };
+        match next {
+            Some(at) => std::thread::park_timeout(at.saturating_duration_since(Instant::now())),
+            None => std::thread::park(),
+        }
+    }
 }
 
 /// A pool of warm offline sessions. Cheap to clone; clones share the pool.
@@ -229,24 +304,30 @@ enum Wait<'a> {
 
 impl SessionPool {
     pub fn new(config: PoolConfig) -> Self {
-        Self {
+        let pool = Self {
             inner: Arc::new(Inner {
                 state: Mutex::new(State::default()),
                 changed: Condvar::new(),
                 config: Mutex::new(config),
                 registry: Mutex::new(None),
+                reaper: Mutex::new(None),
             }),
-        }
+        };
+        pool.inner.ensure_reaper();
+        pool
     }
 
     pub fn config(&self) -> PoolConfig {
         self.inner.config()
     }
 
-    /// Changes the limits; idle sessions beyond the new limit are freed now.
+    /// Changes the limits; idle sessions beyond the new limit, or idle for
+    /// longer than the new timeout, are freed now.
     pub fn set_config(&self, config: PoolConfig) {
         *self.inner.config.lock().unwrap_or_else(PoisonError::into_inner) = config;
         self.trim(config.max_sessions.max(1));
+        self.inner.evict_expired();
+        self.inner.ensure_reaper();
         self.inner.changed.notify_all();
     }
 
@@ -373,6 +454,13 @@ impl SessionPool {
         drop(victims);
     }
 
+    /// Frees idle sessions past [`PoolConfig::idle_timeout`] now. The pool's
+    /// background thread does this on its own; this is for callers that want
+    /// it at a moment of their choosing.
+    pub fn evict_expired(&self) {
+        self.inner.evict_expired();
+    }
+
     /// Frees every idle session, e.g. for a "release memory" button. Sessions
     /// in use are untouched and return to the pool when dropped.
     pub fn evict_idle(&self) {
@@ -414,6 +502,7 @@ impl SessionPool {
         self.inner.changed.notify_all();
         drop(idle);
 
+        self.inner.wake_reaper();
         let mut state = self.inner.state();
         while !state.in_use.is_empty() || state.creating > 0 {
             let now = Instant::now();
@@ -476,18 +565,21 @@ impl PooledSession {
             state.in_use.remove(index);
         }
         let over_limit = state.closed || state.resident() >= self.pool.config().max_sessions.max(1);
-        let freed = match session {
+        let (freed, went_idle) = match session {
             // Over the limit (it was lowered while this was out), or the pool
             // is shut down: free it.
-            Some(session) if over_limit => Some(session),
+            Some(session) if over_limit => (Some(session), false),
             Some(session) => {
                 state.idle.push(Idle { spec: self.spec.clone(), session, last_used: Instant::now() });
-                None
+                (None, true)
             }
-            None => None,
+            None => (None, false),
         };
         drop(state);
         drop(freed);
+        if went_idle {
+            self.pool.wake_reaper();
+        }
         self.pool.changed.notify_all();
     }
 }
