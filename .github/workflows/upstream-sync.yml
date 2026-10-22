@@ -1,12 +1,12 @@
 name: Sync upstream
 
-# Daily: if audio.cpp's main branch moved, regenerate the bindings and the
-# model catalog against it, run the full CI on the result, and open a pull
-# request. A change of the ABI major version stops here for a human.
+# Weekly (Mondays): if audio.cpp's main branch moved, regenerate the bindings
+# and the model catalog against it, run the full CI on the result, and open a
+# pull request. A change of the ABI major version stops here for a human.
 
 on:
   schedule:
-    - cron: "17 0 * * *"
+    - cron: "17 0 * * 1"
   workflow_dispatch:
     inputs:
       ref:
