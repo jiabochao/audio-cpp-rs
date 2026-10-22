@@ -1,8 +1,8 @@
 name: Sync upstream
 
 # Weekly (Mondays): if audio.cpp's main branch moved, regenerate the bindings
-# and the model catalog against it, run the full CI on the result, and open a
-# pull request. A change of the ABI major version stops here for a human.
+# and the model catalog against it, open a pull request, and run the full CI
+# on it. A change of the ABI major version stops here for a human.
 
 on:
   schedule:
@@ -14,6 +14,7 @@ on:
         default: main
 
 permissions:
+  actions: write
   contents: write
   pull-requests: write
 
@@ -40,6 +41,7 @@ jobs:
       - if: steps.update.outputs.changed == 'true'
         run: cargo fmt --all
       - if: steps.update.outputs.changed == 'true'
+        id: pr
         uses: peter-evans/create-pull-request@v7
         with:
           branch: upstream-sync
@@ -51,3 +53,9 @@ jobs:
             Regenerated `audio-cpp-sys/include/audiocpp.h`, `audio-cpp-sys/src/bindings.rs` and
             `src/catalog/model_specs.json`. CI runs on this pull request; merge once it is green.
           delete-branch: true
+      # Pull requests opened with GITHUB_TOKEN trigger no workflows, but a
+      # dispatch does; its checks land on the branch head and show on the PR.
+      - if: steps.pr.outputs.pull-request-operation == 'created' || steps.pr.outputs.pull-request-operation == 'updated'
+        run: gh workflow run ci.yml --ref upstream-sync
+        env:
+          GH_TOKEN: ${{ github.token }}
