@@ -47,7 +47,7 @@ mod archive;
 
 const UPSTREAM: &str = "0xShug0/audio.cpp";
 /// Upstream commit the bindings were generated from; used for source builds.
-const SOURCE_COMMIT: &str = "52118521b338aaa376ad58350ec772342993485b";
+const SOURCE_COMMIT: &str = "7d20b414da088c3ffe56bd8803398d9d158cb847";
 /// Release whose prebuilt archives match [`SOURCE_COMMIT`]. `AUDIOCPP_RELEASE`
 /// overrides it; `latest` follows upstream's newest release instead.
 const PREBUILT_RELEASE: &str = "v0.9.2";
